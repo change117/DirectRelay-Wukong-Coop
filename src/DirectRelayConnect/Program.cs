@@ -4,14 +4,30 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Windows.Forms;
 using Microsoft.Win32;
 
 namespace DirectRelayConnect;
 
 class Program
 {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool AllocConsole();
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool AttachConsole(int dwProcessId);
+
+    [STAThread]
     static void Main(string[] args)
     {
+        // Ensure console is visible
+        if (!AttachConsole(-1))
+        {
+            AllocConsole();
+        }
+
         Console.Title = "DirectRelay Connect [DIAG]";
         Console.WriteLine("========================================================");
         Console.WriteLine("   DirectRelay Connect for ReadyMP (Wukong Co-op) [DIAG] ");
@@ -21,6 +37,30 @@ class Program
         Console.WriteLine($"  Time    : {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
         Console.WriteLine($"  OS      : {Environment.OSVersion}");
         Console.WriteLine("========================================================");
+        Console.WriteLine();
+
+        // === Launch GUI Control Panel ===
+        Log("GUI", "Starting control panel...", ConsoleColor.Cyan);
+        var launchSignal = new ManualResetEvent(false);
+        
+        var guiThread = new Thread(() =>
+        {
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+            var controlPanel = new ControlPanelWindow(launchSignal, Log);
+            Application.Run(controlPanel);
+        });
+        guiThread.SetApartmentState(ApartmentState.STA);
+        guiThread.Start();
+
+        Log("GUI", "Control panel ready", ConsoleColor.Green);
+        Log("GUI", "Waiting for user to configure and launch...", ConsoleColor.Yellow);
+        Console.WriteLine();
+
+        // Block until user clicks "Connect & Launch Game"
+        launchSignal.WaitOne();
+        
+        Log("GUI", "Launch signal received from control panel", ConsoleColor.Green);
         Console.WriteLine();
 
         // --- Load / prompt for settings ---

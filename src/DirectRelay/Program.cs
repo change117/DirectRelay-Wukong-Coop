@@ -6,9 +6,11 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Windows.Forms;
 using LiteNetLib;
 using LiteNetLib.Utils;
 using Microsoft.Win32;
@@ -67,8 +69,21 @@ static class NetDataWriterPool
 
 class Program
 {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool AllocConsole();
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool AttachConsole(int dwProcessId);
+
+    [STAThread]
     static async Task Main(string[] args)
     {
+        // Ensure console is visible
+        if (!AttachConsole(-1))
+        {
+            AllocConsole();
+        }
+
         int port = 7777;
         if (args.Length > 0 && int.TryParse(args[0], out int p))
             port = p;
@@ -90,6 +105,30 @@ class Program
         Console.WriteLine("  Mode              : PRODUCTION (Optimized)");
 #endif
         Console.WriteLine("========================================================");
+        Console.WriteLine();
+
+        // === Launch GUI Control Panel ===
+        Log("GUI", "Starting control panel...", ConsoleColor.Cyan);
+        var launchSignal = new ManualResetEvent(false);
+        
+        var guiThread = new Thread(() =>
+        {
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+            var controlPanel = new ControlPanelWindow(launchSignal, Log);
+            Application.Run(controlPanel);
+        });
+        guiThread.SetApartmentState(ApartmentState.STA);
+        guiThread.Start();
+
+        Log("GUI", "Control panel ready", ConsoleColor.Green);
+        Log("GUI", "Waiting for user to click 'Launch Game'...", ConsoleColor.Yellow);
+        Console.WriteLine();
+
+        // Block until user clicks "Launch Game"
+        launchSignal.WaitOne();
+        
+        Log("GUI", "Launch signal received from control panel", ConsoleColor.Green);
         Console.WriteLine();
 
         // === AUTO-SETUP: Install mods + write handshake for the HOST ===

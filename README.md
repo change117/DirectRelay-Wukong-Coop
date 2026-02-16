@@ -32,7 +32,12 @@ docs/                       <- Reference documentation
 
 1. Download the `HOST` folder
 2. Run `DirectRelay.exe`
-3. **Everything else is automatic:**
+3. **A GUI control panel will appear** with your save management options:
+   - View current save status (Slots 1, 7, 8)
+   - Upload a save backup before launching (optional)
+   - Download a save backup (optional)
+   - Click **"Launch Game & Start Server"** when ready
+4. **Everything else is automatic:**
    - Finds your Black Myth: Wukong installation
    - Installs all mod files to your game directory
    - Writes the connection handshake file
@@ -43,12 +48,56 @@ docs/                       <- Reference documentation
 
 1. Download the `CLIENT` folder
 2. Run `DirectRelayConnect.exe`
-3. Enter the host's IP address when prompted
+3. **A GUI control panel will appear** with your save management options:
+   - View current save status (Slots 1, 7, 8)
+   - Upload a save backup before launching (optional)
+   - Download a save backup (optional)
+   - Enter the host's IP address when prompted (or use saved settings)
+   - Click **"Connect & Launch Game"** when ready
 4. **Everything else is automatic:**
    - Finds your Black Myth: Wukong installation
    - Installs all mod files to your game directory
    - Writes the connection handshake file
    - Launches the game and connects to the relay
+
+---
+
+## Save File Management
+
+Both DirectRelay and DirectRelayConnect now include a **pre-launch GUI control panel** that lets you manage save files before starting the game.
+
+### What is Save Management?
+
+Black Myth: Wukong uses different save slots for single-player and co-op:
+- **Slot 1**: Vanilla single-player save
+- **Slot 7**: Co-op player save
+- **Slot 8**: Co-op world save
+
+The GUI control panel lets you:
+- **View** which save slots currently exist and when they were last modified
+- **Upload** a save backup (`.wksave` file) to restore saves before launching
+- **Download** a save backup to create a checkpoint you can restore later
+
+### Save File Format
+
+Save backups use the `.wksave` format (a ZIP archive containing):
+- All your save files (`ArchiveFile_*.sav`)
+- Metadata JSON with timestamp and user info
+
+### Common Use Cases
+
+**Scenario 1: Switch between single-player and co-op saves**
+1. Before starting co-op, click **"Download Save"** to backup your single-player progress
+2. Later, upload that backup to restore your single-player save
+
+**Scenario 2: Create checkpoints before difficult bosses**
+1. Download a save backup before a tough fight
+2. If you die and lose progress, upload the backup to try again
+
+**Scenario 3: Share saves with a friend**
+1. Host downloads their co-op save
+2. Friend uploads that save on their machine
+3. Both players now have the same progress
 
 ---
 
@@ -109,17 +158,20 @@ Both players must have Black Myth: Wukong installed via Steam. The tools auto-de
 | Game launches but no co-op | Both players need the mod files installed. The tools do this automatically, but check the console output for any `[FAIL]` messages during the `[MOD]` step. |
 | Friend's connection times out | The relay server must be running BEFORE the friend launches. Host runs `DirectRelay.exe` first, then the friend runs `DirectRelayConnect.exe`. |
 | "Multiplayer is disabled" in-game | The handshake file was missing or expired. Close the game, run the tool again (it writes a fresh handshake), and relaunch. |
+| GUI doesn't appear | The console window should appear with the GUI. If only the console appears, check the console output for error messages. Make sure you're running on Windows. |
+| Save files not found | The game must have been run at least once to create the save directory at `%LocalAppData%\b1\Saved\SaveGames\<SteamID>`. |
 
 ---
 
 ## How It Works
 
-1. **Mod files** (`ReadyM.Relay.Client.dll`, `WukongMp.Coop.dll`, etc.) add multiplayer networking to the game using LiteNetLib
-2. A **handshake file** (`%AppData%\ReadyM.Launcher\wukong_handshake.env`) tells the game where to connect and who you are
-3. The **relay server** (`DirectRelay.exe`) accepts connections from both players and forwards game data between them
-4. The game reads the handshake on startup (and deletes it), connects to the relay, and co-op begins
+1. **GUI Control Panel** - A small window appears before launch, letting you manage save files and view save status
+2. **Mod files** (`ReadyM.Relay.Client.dll`, `WukongMp.Coop.dll`, etc.) add multiplayer networking to the game using LiteNetLib
+3. A **handshake file** (`%AppData%\ReadyM.Launcher\wukong_handshake.env`) tells the game where to connect and who you are
+4. The **relay server** (`DirectRelay.exe`) accepts connections from both players and forwards game data between them
+5. The game reads the handshake on startup (and deletes it), connects to the relay, and co-op begins
 
-The tools automate all of this — installing mods, writing the handshake, launching the game, and running the relay.
+The tools automate all of this — showing the GUI, installing mods, writing the handshake, launching the game, and running the relay. All diagnostic logging appears in the console window that runs alongside the GUI.
 
 ---
 
