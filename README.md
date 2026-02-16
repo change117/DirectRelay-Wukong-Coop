@@ -7,13 +7,21 @@ Play Black Myth: Wukong co-op using a direct relay server — no third-party lau
 ## What's In This Repo
 
 ```
-HOST/                ← The person hosting the game uses this folder
-  DirectRelay.exe    ← Run this. That's it.
-  mods/              ← Mod files (auto-installed to your game)
+HOST/                       <- The person hosting the game uses this folder
+  DirectRelay.exe           <- Run this. That's it.
+  mods/                     <- Mod files (auto-installed to your game)
 
-CLIENT/              ← The person joining uses this folder
-  DirectRelayConnect.exe  ← Run this. That's it.
-  mods/                   ← Mod files (auto-installed to your game)
+CLIENT/                     <- The person joining uses this folder
+  DirectRelayConnect.exe    <- Run this. That's it.
+  mods/                     <- Mod files (auto-installed to your game)
+
+src/                        <- Source code (for developers)
+  DirectRelay/              <- HOST relay server source (C# / .NET 8)
+  DirectRelayConnect/       <- CLIENT connector source (C# / .NET 8)
+  DirectRelay-Wukong-Coop.sln <- Visual Studio solution file
+
+docs/                       <- Reference documentation
+  decompiled/               <- Decompiled ReadyM mod sources (read-only reference)
 ```
 
 ---

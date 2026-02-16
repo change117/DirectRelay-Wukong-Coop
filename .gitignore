@@ -1,16 +1,41 @@
-# VS metadata
+# === Visual Studio ===
 .vs/
 CopilotIndices/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
 
-# Old folders (replaced by HOST/ and CLIENT/)
+# === Build outputs ===
+[Bb]in/
+[Oo]bj/
+[Dd]ebug/
+[Rr]elease/
+publish/
+*.sqlite
+
+# === NuGet ===
+packages/
+*.nupkg
+project.lock.json
+
+# === Backup files ===
+*.bak
+*.bak2
+*.new.cs
+
+# === Old folders ===
 SERVER-DirectRelay/
 CLIENT-DirectRelayConnect/
 MOD-FILES-FOR-FRIEND/
 
-# Old archives and readmes
+# === Archives ===
 *.rar
 *.zip
+
+# === Old readme ===
 README.txt
 
-# Build artifacts
-*.sqlite
+# === OS files ===
+Thumbs.db
+.DS_Store
