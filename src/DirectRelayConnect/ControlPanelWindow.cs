@@ -10,7 +10,6 @@ public class ControlPanelWindow : Form
     private readonly ManualResetEvent _launchSignal;
     private readonly Action<string, string, ConsoleColor> _logger;
     
-    private Label _statusLabel = null!;
     private Label _slot1Label = null!;
     private Label _slot7Label = null!;
     private Label _slot8Label = null!;

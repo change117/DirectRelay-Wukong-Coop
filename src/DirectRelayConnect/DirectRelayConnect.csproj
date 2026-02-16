@@ -6,6 +6,7 @@
     <Nullable>enable</Nullable>
     <NoWarn>CA1416</NoWarn>
     <UseWindowsForms>true</UseWindowsForms>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
   </PropertyGroup>
   <ItemGroup>
     <Compile Remove="Program.new.cs" />
