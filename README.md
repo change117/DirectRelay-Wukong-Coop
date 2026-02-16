@@ -132,3 +132,75 @@ The tools automate all of this — installing mods, writing the handshake, launc
 | Timeout | 30 seconds |
 | Max Players | 2+ (relay forwards to all connected) |
 
+---
+
+## Building from Source
+
+The relay supports two build modes for different use cases:
+
+### Production Mode (Default - Maximum Performance)
+```bash
+dotnet build -c Release
+```
+- Zero logging in critical packet forwarding path (hot path)
+- Statistics disabled
+- Optimized for sub-5ms relay overhead
+- Lock-free packet forwarding
+- Zero-copy buffer operations
+- For actual gameplay
+
+### Diagnostic Mode (Troubleshooting)
+```bash
+dotnet build -c Debug
+```
+- Full packet logging enabled
+- Statistics tracking enabled
+- Performance monitoring
+- For diagnosing connection issues
+- Automatically enabled in Debug configuration
+
+### Configuration File
+
+The relay can be tuned via `relay_config.json` without recompiling:
+
+```json
+{
+  "Network": {
+    "Port": 7777,
+    "UpdateTimeMs": 1,
+    "DisconnectTimeoutMs": 30000,
+    "SendBufferSizeKB": 1024,
+    "ReceiveBufferSizeKB": 1024,
+    "MTU": 1400
+  },
+  "Performance": {
+    "HighPriorityThread": true,
+    "HighPriorityProcess": true,
+    "EnableStatistics": false
+  },
+  "Diagnostics": {
+    "LogPackets": false,
+    "LogConnections": true,
+    "LogErrors": true,
+    "LogFilePath": "relay_diagnostics.log"
+  }
+}
+```
+
+### Performance Optimizations
+
+The relay includes several network performance optimizations for 2-player co-op:
+
+- **Lock-free hot path**: ConcurrentDictionary + atomic operations eliminate lock contention in the critical packet forwarding code path
+- **Zero-copy forwarding**: Direct buffer sends without intermediate allocations
+- **Object pooling**: NetDataWriter pool eliminates GC pressure
+- **Conditional compilation**: Production builds have zero logging overhead
+- **Thread priority**: High-priority threads for consistent frame times
+- **Optimized LiteNetLib**: 1ms update time, disabled statistics in production
+
+**Performance Targets:**
+- Packet forwarding latency: <1ms
+- Total relay overhead: <5ms
+- Memory allocations: Near-zero in hot path (critical forwarding code)
+- CPU usage: <2% on modern hardware
+
