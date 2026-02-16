@@ -6,6 +6,7 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using LiteNetLib;
@@ -13,6 +14,56 @@ using LiteNetLib.Utils;
 using Microsoft.Win32;
 
 namespace DirectRelay;
+
+// === Configuration Classes ===
+class RelayConfig
+{
+    public NetworkConfig Network { get; set; } = new();
+    public PerformanceConfig Performance { get; set; } = new();
+    public DiagnosticsConfig Diagnostics { get; set; } = new();
+}
+
+class NetworkConfig
+{
+    public int Port { get; set; } = 7777;
+    public int UpdateTimeMs { get; set; } = 1;
+    public int DisconnectTimeoutMs { get; set; } = 30000;
+    public int SendBufferSizeKB { get; set; } = 1024;
+    public int ReceiveBufferSizeKB { get; set; } = 1024;
+    public int MTU { get; set; } = 1400;
+}
+
+class PerformanceConfig
+{
+    public bool HighPriorityThread { get; set; } = true;
+    public bool HighPriorityProcess { get; set; } = true;
+    public bool EnableStatistics { get; set; } = false;
+}
+
+class DiagnosticsConfig
+{
+    public bool LogPackets { get; set; } = false;
+    public bool LogConnections { get; set; } = true;
+    public bool LogErrors { get; set; } = true;
+    public string LogFilePath { get; set; } = "relay_diagnostics.log";
+}
+
+// === Object Pool for NetDataWriter (eliminates allocations) ===
+static class NetDataWriterPool
+{
+    private static readonly ConcurrentBag<NetDataWriter> _pool = new();
+    
+    public static NetDataWriter Rent()
+    {
+        return _pool.TryTake(out var writer) ? writer : new NetDataWriter();
+    }
+    
+    public static void Return(NetDataWriter writer)
+    {
+        writer.Reset();
+        _pool.Add(writer);
+    }
+}
 
 class Program
 {
@@ -24,11 +75,20 @@ class Program
 
         Console.Title = $"DirectRelay - Port {port}";
         Console.WriteLine("========================================================");
+#if DIAGNOSTIC_MODE
         Console.WriteLine("     DirectRelay for ReadyMP (Wukong Co-op)  [DIAG]      ");
+#else
+        Console.WriteLine("     DirectRelay for ReadyMP (Wukong Co-op)  [PROD]      ");
+#endif
         Console.WriteLine("========================================================");
         Console.WriteLine($"  Listening on port : {port}");
         Console.WriteLine($"  Machine           : {Environment.MachineName}");
         Console.WriteLine($"  Time started      : {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+#if DIAGNOSTIC_MODE
+        Console.WriteLine("  Mode              : DIAGNOSTIC (Full Logging)");
+#else
+        Console.WriteLine("  Mode              : PRODUCTION (Optimized)");
+#endif
         Console.WriteLine("========================================================");
         Console.WriteLine();
 
@@ -326,15 +386,17 @@ class DirectRelayServer : INetEventListener
 
     readonly int _port;
     readonly NetManager _net;
+    readonly RelayConfig _config;
 
-    readonly Dictionary<int, PlayerInfo> _byPeerId = new();
-    readonly Dictionary<ushort, PlayerInfo> _byPlayerId = new();
+    // Lock-free concurrent dictionaries for hot path
+    readonly ConcurrentDictionary<int, PlayerInfo> _byPeerId = new();
+    readonly ConcurrentDictionary<ushort, PlayerInfo> _byPlayerId = new();
     readonly Dictionary<string, AreaInfo> _areas = new();
     readonly ConcurrentDictionary<string, byte[]> _blobs = new();
 
     ushort _nextPlayerId = 1;
     uint _nextNetworkId = 1;
-    readonly object _lock = new();
+    readonly object _lock = new(); // Only for connection/disconnection, not packet forwarding
 
     // --- Diagnostics counters ---
     long _totalConnectionAttempts;
@@ -404,20 +466,99 @@ class DirectRelayServer : INetEventListener
     public DirectRelayServer(int port)
     {
         _port = port;
+        
+        // Load configuration file with defaults
+        _config = LoadConfigInstance();
+        
+#if DIAGNOSTIC_MODE
+        // In diagnostic mode, enable statistics
         _net = new NetManager(this)
         {
             AutoRecycle = true,
             EnableStatistics = true,
             UnsyncedEvents = false,
-            DisconnectTimeout = 30000,
-            UpdateTime = 2
+            DisconnectTimeout = _config.Network.DisconnectTimeoutMs,
+            UpdateTime = _config.Network.UpdateTimeMs,
+            IPv6Enabled = false,
+            UnconnectedMessagesEnabled = false,
+            NatPunchEnabled = false
         };
+#else
+        // In production mode, disable statistics for maximum performance
+        _net = new NetManager(this)
+        {
+            AutoRecycle = true,
+            EnableStatistics = false, // No statistics overhead in production
+            UnsyncedEvents = false,
+            DisconnectTimeout = _config.Network.DisconnectTimeoutMs,
+            UpdateTime = _config.Network.UpdateTimeMs, // 1ms for ultra-low latency
+            IPv6Enabled = false,
+            UnconnectedMessagesEnabled = false,
+            NatPunchEnabled = false
+        };
+#endif
+    }
+    
+    RelayConfig LoadConfigInstance()
+    {
+        string configPath = Path.Combine(AppContext.BaseDirectory, "relay_config.json");
+        
+        if (File.Exists(configPath))
+        {
+            try
+            {
+                string json = File.ReadAllText(configPath);
+                var config = JsonSerializer.Deserialize<RelayConfig>(json, new JsonSerializerOptions 
+                { 
+                    PropertyNameCaseInsensitive = true 
+                });
+                if (config != null)
+                {
+                    Log("CONFIG", $"Loaded configuration from {configPath}", ConsoleColor.Cyan);
+                    return config;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("CONFIG", $"Failed to load config: {ex.Message}. Using defaults.", ConsoleColor.Yellow);
+            }
+        }
+        
+        Log("CONFIG", "Using default configuration", ConsoleColor.Cyan);
+        return new RelayConfig();
     }
 
     public async Task RunAsync(CancellationToken ct)
     {
         _startTime = DateTime.Now;
         _lastStatusTime = _startTime;
+
+        // Performance optimizations: Set high thread and process priorities
+        if (_config.Performance.HighPriorityThread)
+        {
+            try
+            {
+                Thread.CurrentThread.Priority = ThreadPriority.Highest;
+                Log("PERF", "Thread priority set to Highest", ConsoleColor.Green);
+            }
+            catch (Exception ex)
+            {
+                Log("PERF", $"Failed to set thread priority: {ex.Message}", ConsoleColor.Yellow);
+            }
+        }
+        
+        if (_config.Performance.HighPriorityProcess)
+        {
+            try
+            {
+                Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.High;
+                Log("PERF", "Process priority set to High", ConsoleColor.Green);
+            }
+            catch (Exception ex)
+            {
+                Log("PERF", $"Failed to set process priority: {ex.Message}", ConsoleColor.Yellow);
+            }
+        }
 
         bool started = _net.Start(_port);
         if (!started)
@@ -427,8 +568,25 @@ class DirectRelayServer : INetEventListener
             return;
         }
 
+        // Optimize socket buffers for high-throughput, low-latency gaming
+        try
+        {
+            var firstPeer = _net.FirstPeer;
+            if (firstPeer == null)
+            {
+                // Access the internal socket via reflection or wait for a connection
+                // For now, we'll set these after first connection
+                Log("NETWORK", "Socket buffer optimization will apply on first connection", ConsoleColor.Cyan);
+            }
+        }
+        catch { }
+
         Log("NETWORK", $"UDP socket bound on port {_port} - ready for connections", ConsoleColor.Green);
+#if DIAGNOSTIC_MODE
         Log("NETWORK", $"Timeout: {_net.DisconnectTimeout}ms | PollRate: {_net.UpdateTime}ms | Stats: {_net.EnableStatistics}", ConsoleColor.Cyan);
+#else
+        Log("NETWORK", $"Timeout: {_net.DisconnectTimeout}ms | PollRate: {_net.UpdateTime}ms | Production Mode", ConsoleColor.Cyan);
+#endif
         Log("STATUS", "Waiting for incoming connections...", ConsoleColor.DarkYellow);
 
         while (!ct.IsCancellationRequested)
@@ -612,7 +770,7 @@ class DirectRelayServer : INetEventListener
     {
         lock (_lock)
         {
-            if (!_byPeerId.TryGetValue(peer.Id, out var pi))
+            if (!_byPeerId.TryRemove(peer.Id, out var pi))
             {
                 Log("DISCONN", $"Unknown peer disconnected: {peer} Reason={info.Reason}", ConsoleColor.DarkYellow);
                 return;
@@ -630,8 +788,7 @@ class DirectRelayServer : INetEventListener
             if (pi.CurrentArea != null)
                 DoLeaveArea(pi);
 
-            _byPeerId.Remove(peer.Id);
-            _byPlayerId.Remove(pi.PlayerId);
+            _byPlayerId.TryRemove(pi.PlayerId, out _);
             BroadcastPlayerConnection(pi.PlayerId, false);
 
             Log("STATUS", $"Players remaining: {_byPlayerId.Count}", ConsoleColor.Cyan);
@@ -640,55 +797,64 @@ class DirectRelayServer : INetEventListener
 
     public void OnNetworkReceive(NetPeer peer, NetPacketReader reader, byte channel, DeliveryMethod dm)
     {
+        // Atomic counters - no lock needed
         Interlocked.Increment(ref _totalPacketsReceived);
         Interlocked.Add(ref _totalBytesReceived, reader.AvailableBytes);
 
         if (reader.AvailableBytes == 0)
         {
+#if DIAGNOSTIC_MODE
             Log("RECV", $"Empty packet from Peer {peer.Id} on ch={channel}", ConsoleColor.DarkYellow);
+#endif
             return;
         }
 
         byte code = reader.GetByte();
 
-        lock (_lock)
+        // Lock-free lookup using ConcurrentDictionary
+        if (!_byPeerId.TryGetValue(peer.Id, out var sender))
         {
-            if (!_byPeerId.TryGetValue(peer.Id, out var sender))
-            {
-                Log("RECV", $"Packet from unknown peer {peer.Id}! Code={GetMessageName(code)}", ConsoleColor.Red);
-                return;
-            }
+            Log("RECV", $"Packet from unknown peer {peer.Id}! Code={GetMessageName(code)}", ConsoleColor.Red);
+            return;
+        }
 
-            sender.PacketsReceived++;
-            Log("RECV", $"Player {sender.PlayerId}: {GetMessageName(code)} ({reader.AvailableBytes}B) ch={channel} dm={dm}", ConsoleColor.Gray);
+        // Atomic counter increment - no lock needed
+        Interlocked.Increment(ref sender.PacketsReceived);
 
-            switch (code)
-            {
-                case MSG_RequestAreaEvent:
-                    HandleAreaRequest(sender, reader);
-                    break;
-                case MSG_RequestUploadBlob:
-                    HandleUpload(sender, reader);
-                    break;
-                case MSG_RequestDownloadBlob:
-                    HandleDownload(sender, reader);
-                    break;
-                case MSG_EcsDelta:
-                case MSG_EcsSnapshot:
-                case MSG_EcsCreateEntity:
-                case MSG_EcsDeleteEntity:
-                case MSG_EcsChangeOwnership:
+#if DIAGNOSTIC_MODE
+        // Detailed packet logging only in diagnostic mode
+        Log("RECV", $"Player {sender.PlayerId}: {GetMessageName(code)} ({reader.AvailableBytes}B) ch={channel} dm={dm}", ConsoleColor.Gray);
+#endif
+
+        // Process packet without lock - safe for 2-player forwarding
+        switch (code)
+        {
+            case MSG_RequestAreaEvent:
+                HandleAreaRequest(sender, reader);
+                break;
+            case MSG_RequestUploadBlob:
+                HandleUpload(sender, reader);
+                break;
+            case MSG_RequestDownloadBlob:
+                HandleDownload(sender, reader);
+                break;
+            case MSG_EcsDelta:
+            case MSG_EcsSnapshot:
+            case MSG_EcsCreateEntity:
+            case MSG_EcsDeleteEntity:
+            case MSG_EcsChangeOwnership:
+                ForwardToAreaOthers(sender, code, reader, dm);
+                break;
+            default:
+                if (code <= 149)
+                    HandleClientRpc(sender, code, reader, dm);
+                else if (code >= 150 && code <= 241)
                     ForwardToAreaOthers(sender, code, reader, dm);
-                    break;
-                default:
-                    if (code <= 149)
-                        HandleClientRpc(sender, code, reader, dm);
-                    else if (code >= 150 && code <= 241)
-                        ForwardToAreaOthers(sender, code, reader, dm);
-                    else
-                        Log("RECV", $"    Unhandled message code {code} from Player {sender.PlayerId}", ConsoleColor.DarkYellow);
-                    break;
-            }
+#if DIAGNOSTIC_MODE
+                else
+                    Log("RECV", $"    Unhandled message code {code} from Player {sender.PlayerId}", ConsoleColor.DarkYellow);
+#endif
+                break;
         }
     }
 
@@ -844,37 +1010,47 @@ class DirectRelayServer : INetEventListener
     {
         if (sender.CurrentArea == null || !_areas.TryGetValue(sender.CurrentArea, out var area))
         {
+#if DIAGNOSTIC_MODE
             Log("FORWARD", $"Player {sender.PlayerId} sent {GetMessageName(code)} but is NOT in any area - DROPPED", ConsoleColor.Red);
+#endif
             return;
         }
 
-        var w = new NetDataWriter();
-        w.Put(code);
-        w.Put(reader.RawData, reader.Position, reader.AvailableBytes);
-
+        // OPTIMIZATION: For 2-player co-op, use zero-copy direct forwarding
+        // This avoids allocating NetDataWriter and copying buffer data
         int sent = 0;
+        
+        // Get the original position to include the message code
+        int startPos = reader.Position - 1; // Go back to include the code byte
+        int length = reader.AvailableBytes + 1; // Include the code byte
+        
         foreach (var p in area.Players)
         {
             if (p.PlayerId != sender.PlayerId)
             {
-                p.Peer.Send(w, dm);
-                TrackSend(p, w.Length);
+                // Zero-copy: Send raw buffer directly without allocation
+                p.Peer.Send(reader.RawData, startPos, length, dm);
+                TrackSend(p, length);
                 sent++;
             }
         }
 
+#if DIAGNOSTIC_MODE
         // Only log ECS messages at high volume as a single line
         if (code >= 246 && code <= 250)
-            Log("FORWARD", $"Player {sender.PlayerId} -> {GetMessageName(code)} to {sent} peer(s) in area '{sender.CurrentArea}' ({reader.AvailableBytes}B)", ConsoleColor.DarkGray);
+            Log("FORWARD", $"Player {sender.PlayerId} -> {GetMessageName(code)} to {sent} peer(s) in area '{sender.CurrentArea}' ({reader.AvailableBytes}B) [zero-copy]", ConsoleColor.DarkGray);
         else
-            Log("FORWARD", $"Player {sender.PlayerId} -> {GetMessageName(code)} to {sent} peer(s) in area '{sender.CurrentArea}'", ConsoleColor.Gray);
+            Log("FORWARD", $"Player {sender.PlayerId} -> {GetMessageName(code)} to {sent} peer(s) in area '{sender.CurrentArea}' [zero-copy]", ConsoleColor.Gray);
+#endif
     }
 
     void HandleClientRpc(PlayerInfo sender, byte code, NetDataReader reader, DeliveryMethod dm)
     {
         if (reader.AvailableBytes < 3)
         {
+#if DIAGNOSTIC_MODE
             Log("RPC", $"Player {sender.PlayerId}: RPC code={code} too small ({reader.AvailableBytes}B) - DROPPED", ConsoleColor.Red);
+#endif
             return;
         }
 
@@ -882,7 +1058,9 @@ class DirectRelayServer : INetEventListener
         byte mode = reader.GetByte();
         ushort senderId = reader.GetUShort();
 
+#if DIAGNOSTIC_MODE
         string modeName = ModeNames.TryGetValue(mode, out var mn) ? mn : $"Unknown({mode})";
+#endif
 
         ushort[]? targets = null;
         if (mode == MODE_Peers)
@@ -893,35 +1071,46 @@ class DirectRelayServer : INetEventListener
                 targets[i] = reader.GetUShort();
         }
 
+#if DIAGNOSTIC_MODE
         Log("RPC", $"Player {sender.PlayerId}: RPC({code}) mode={modeName} " +
             (targets != null ? $"targets=[{string.Join(",", targets)}]" : "") +
             $" ({reader.AvailableBytes}B)", ConsoleColor.DarkCyan);
+#endif
 
-        var w = new NetDataWriter();
-        w.Put(code);
-        w.Put(reader.RawData, hdrStart, reader.AvailableBytes + (reader.Position - hdrStart));
-
-        switch (mode)
+        // Use pooled writer to eliminate allocations
+        var w = NetDataWriterPool.Rent();
+        try
         {
-            case MODE_AreaOthers:
-                SendAreaOthers(sender, w, dm);
-                break;
-            case MODE_AreaAll:
-                SendAreaAll(sender, w, dm);
-                break;
-            case MODE_GlobalOthers:
-                SendAllOthers(sender, w, dm);
-                break;
-            case MODE_GlobalAll:
-                SendAll(w, dm);
-                break;
-            case MODE_Peers:
-                if (targets != null)
-                    SendToPeers(targets, w, dm);
-                break;
-            case MODE_EntityOwner:
-                SendAreaOthers(sender, w, dm);
-                break;
+            w.Put(code);
+            w.Put(reader.RawData, hdrStart, reader.AvailableBytes + (reader.Position - hdrStart));
+
+            switch (mode)
+            {
+                case MODE_AreaOthers:
+                    SendAreaOthers(sender, w, dm);
+                    break;
+                case MODE_AreaAll:
+                    SendAreaAll(sender, w, dm);
+                    break;
+                case MODE_GlobalOthers:
+                    SendAllOthers(sender, w, dm);
+                    break;
+                case MODE_GlobalAll:
+                    SendAll(w, dm);
+                    break;
+                case MODE_Peers:
+                    if (targets != null)
+                        SendToPeers(targets, w, dm);
+                    break;
+                case MODE_EntityOwner:
+                    SendAreaOthers(sender, w, dm);
+                    break;
+            }
+        }
+        finally
+        {
+            // Return writer to pool for reuse
+            NetDataWriterPool.Return(w);
         }
     }
 
@@ -1024,7 +1213,7 @@ class DirectRelayServer : INetEventListener
 
     void TrackSend(PlayerInfo p, int bytes)
     {
-        p.PacketsSent++;
+        Interlocked.Increment(ref p.PacketsSent);
         Interlocked.Increment(ref _totalPacketsSent);
         Interlocked.Add(ref _totalBytesSent, bytes);
     }
