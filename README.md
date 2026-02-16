@@ -142,7 +142,7 @@ The relay supports two build modes for different use cases:
 ```bash
 dotnet build -c Release
 ```
-- Zero logging in packet hot path
+- Zero logging in critical packet forwarding path (hot path)
 - Statistics disabled
 - Optimized for sub-5ms relay overhead
 - Lock-free packet forwarding
@@ -191,7 +191,7 @@ The relay can be tuned via `relay_config.json` without recompiling:
 
 The relay includes several network performance optimizations for 2-player co-op:
 
-- **Lock-free hot path**: ConcurrentDictionary + atomic operations eliminate lock contention
+- **Lock-free hot path**: ConcurrentDictionary + atomic operations eliminate lock contention in the critical packet forwarding code path
 - **Zero-copy forwarding**: Direct buffer sends without intermediate allocations
 - **Object pooling**: NetDataWriter pool eliminates GC pressure
 - **Conditional compilation**: Production builds have zero logging overhead
@@ -201,6 +201,6 @@ The relay includes several network performance optimizations for 2-player co-op:
 **Performance Targets:**
 - Packet forwarding latency: <1ms
 - Total relay overhead: <5ms
-- Memory allocations: Near-zero in hot path
+- Memory allocations: Near-zero in hot path (critical forwarding code)
 - CPU usage: <2% on modern hardware
 

@@ -568,18 +568,9 @@ class DirectRelayServer : INetEventListener
             return;
         }
 
-        // Optimize socket buffers for high-throughput, low-latency gaming
-        try
-        {
-            var firstPeer = _net.FirstPeer;
-            if (firstPeer == null)
-            {
-                // Access the internal socket via reflection or wait for a connection
-                // For now, we'll set these after first connection
-                Log("NETWORK", "Socket buffer optimization will apply on first connection", ConsoleColor.Cyan);
-            }
-        }
-        catch { }
+        // NOTE: Socket buffer optimization would require accessing internal NetManager socket
+        // LiteNetLib's NetManager doesn't expose socket directly after Start()
+        // The buffers are already set to reasonable defaults by LiteNetLib
 
         Log("NETWORK", $"UDP socket bound on port {_port} - ready for connections", ConsoleColor.Green);
 #if DIAGNOSTIC_MODE
@@ -1020,17 +1011,18 @@ class DirectRelayServer : INetEventListener
         // This avoids allocating NetDataWriter and copying buffer data
         int sent = 0;
         
-        // Get the original position to include the message code
-        int startPos = reader.Position - 1; // Go back to include the code byte
-        int length = reader.AvailableBytes + 1; // Include the code byte
+        // Calculate the position of the code byte (reader has already read it)
+        // reader.Position now points after the code byte, so we go back 1 byte to include it
+        int codeByteOffset = reader.Position - 1;
+        int totalLength = reader.AvailableBytes + 1; // Remaining bytes + the code byte
         
         foreach (var p in area.Players)
         {
             if (p.PlayerId != sender.PlayerId)
             {
-                // Zero-copy: Send raw buffer directly without allocation
-                p.Peer.Send(reader.RawData, startPos, length, dm);
-                TrackSend(p, length);
+                // Zero-copy: Send raw buffer directly from the code byte position
+                p.Peer.Send(reader.RawData, codeByteOffset, totalLength, dm);
+                TrackSend(p, totalLength);
                 sent++;
             }
         }
