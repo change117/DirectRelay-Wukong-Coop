@@ -1,0 +1,16 @@
+# VS metadata
+.vs/
+CopilotIndices/
+
+# Old folders (replaced by HOST/ and CLIENT/)
+SERVER-DirectRelay/
+CLIENT-DirectRelayConnect/
+MOD-FILES-FOR-FRIEND/
+
+# Old archives and readmes
+*.rar
+*.zip
+README.txt
+
+# Build artifacts
+*.sqlite
