@@ -19,6 +19,10 @@ class Program
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool AttachConsole(int dwProcessId);
 
+    // File-based diagnostic log — every session writes to a file you can share
+    static StreamWriter? _logFile;
+    static readonly object _logLock = new();
+
     [STAThread]
     static void Main(string[] args)
     {
@@ -27,6 +31,17 @@ class Program
         {
             AllocConsole();
         }
+
+        // Open diagnostic log file
+        try
+        {
+            string logPath = Path.Combine(AppContext.BaseDirectory, $"directrelayconnect_{DateTime.Now:yyyyMMdd_HHmmss}.log");
+            _logFile = new StreamWriter(logPath, append: false) { AutoFlush = true };
+            _logFile.WriteLine($"=== DirectRelayConnect Diagnostic Log - {DateTime.Now:yyyy-MM-dd HH:mm:ss} ===");
+            _logFile.WriteLine($"Machine: {Environment.MachineName} | User: {Environment.UserName} | OS: {Environment.OSVersion}");
+            _logFile.WriteLine();
+        }
+        catch { }
 
         Console.Title = "DirectRelay Connect [DIAG]";
         Console.WriteLine("========================================================");
@@ -121,6 +136,9 @@ class Program
         }
         Console.WriteLine();
 
+        // === Auto-create Windows Firewall rule ===
+        EnsureFirewallRule(portNum);
+
         // === STEP 1: Verify network connectivity to the relay server ===
         Log("NETWORK", $"Testing connectivity to {hostIp}:{port}...", ConsoleColor.Yellow);
 
@@ -146,20 +164,104 @@ class Program
             return;
         }
 
-        // UDP reachability test
+        // UDP reachability test — send diagnostic ping to relay and wait for pong
+        Log("NETWORK", $"  Sending diagnostic ping to relay at {hostIp}:{portNum}...", ConsoleColor.Yellow);
+        bool relayReachable = false;
         try
         {
             using var udp = new UdpClient();
+            udp.Client.ReceiveTimeout = 3000;
+            udp.Client.SendTimeout = 3000;
             udp.Connect(hostIp, portNum);
             var localEp = (IPEndPoint)udp.Client.LocalEndPoint!;
             Log("NETWORK", $"  UDP socket OK - local endpoint: {localEp}", ConsoleColor.Green);
-            Log("NETWORK", $"  NOTE: UDP is connectionless - can't verify server is listening", ConsoleColor.DarkGray);
-            Log("NETWORK", $"        until the game actually connects. Check the relay console.", ConsoleColor.DarkGray);
+
+            // Send diagnostic ping (the relay echoes these back with status info)
+            byte[] pingData = System.Text.Encoding.UTF8.GetBytes("DIRECTRELAY_DIAG_PING");
+            udp.Send(pingData, pingData.Length);
+            Log("NETWORK", $"  Diagnostic ping sent, waiting for relay response...", ConsoleColor.Yellow);
+
+            try
+            {
+                var remoteEp = new IPEndPoint(IPAddress.Any, 0);
+                byte[] response = udp.Receive(ref remoteEp);
+                string responseStr = System.Text.Encoding.UTF8.GetString(response);
+
+                // LiteNetLib wraps the data — skip the first 4 bytes (length prefix from Put(byte[]))
+                // The relay sends: writer.Put(byte[]) which prefixes with int32 length
+                if (response.Length > 4)
+                {
+                    // Try to find the DIRECTRELAY_DIAG_PONG marker
+                    string fullResponse = System.Text.Encoding.UTF8.GetString(response);
+                    int pongIdx = fullResponse.IndexOf("DIRECTRELAY_DIAG_PONG");
+                    if (pongIdx >= 0)
+                    {
+                        string pongData = fullResponse.Substring(pongIdx);
+                        relayReachable = true;
+                        Log("NETWORK", $"  *** RELAY IS ALIVE AND RESPONDING! ***", ConsoleColor.Green);
+
+                        // Parse pong fields
+                        var fields = pongData.Split('|');
+                        foreach (var field in fields)
+                        {
+                            if (field.StartsWith("players="))
+                                Log("NETWORK", $"    Players connected: {field.Split('=')[1]}", ConsoleColor.Cyan);
+                            else if (field.StartsWith("uptime="))
+                                Log("NETWORK", $"    Relay uptime: {field.Split('=')[1]}", ConsoleColor.Cyan);
+                            else if (field.StartsWith("areas="))
+                                Log("NETWORK", $"    Active areas: {field.Split('=')[1]}", ConsoleColor.Cyan);
+                            else if (field.StartsWith("pkts_in="))
+                                Log("NETWORK", $"    Packets received: {field.Split('=')[1]}", ConsoleColor.DarkCyan);
+                            else if (field.StartsWith("pkts_out="))
+                                Log("NETWORK", $"    Packets sent: {field.Split('=')[1]}", ConsoleColor.DarkCyan);
+                        }
+                    }
+                    else
+                    {
+                        Log("NETWORK", $"  Got response ({response.Length} bytes) but not a diagnostic pong", ConsoleColor.Yellow);
+                        Log("NETWORK", $"  The relay may be an older version without diagnostic echo", ConsoleColor.DarkGray);
+                    }
+                }
+                else
+                {
+                    Log("NETWORK", $"  Got response ({response.Length} bytes), relay is reachable", ConsoleColor.Green);
+                    relayReachable = true;
+                }
+            }
+            catch (SocketException sex) when (sex.SocketErrorCode == SocketError.TimedOut)
+            {
+                Log("WARNING", $"  *** NO RESPONSE FROM RELAY within 3 seconds ***", ConsoleColor.Red);
+                Log("WARNING", $"  This usually means one of:", ConsoleColor.Red);
+                Log("WARNING", $"    1. DirectRelay.exe is NOT running on the host machine", ConsoleColor.Yellow);
+                Log("WARNING", $"    2. Wrong IP address (host's IP might be different)", ConsoleColor.Yellow);
+                Log("WARNING", $"    3. Firewall on HOST is blocking inbound UDP {portNum}", ConsoleColor.Yellow);
+                Log("WARNING", $"    4. Router/NAT is not forwarding port {portNum} to the host (if over internet)", ConsoleColor.Yellow);
+                Log("WARNING", $"    5. An antivirus/security suite is blocking the traffic", ConsoleColor.Yellow);
+                Log("WARNING", $"", ConsoleColor.Yellow);
+                Log("WARNING", $"  Ask the HOST to:", ConsoleColor.Cyan);
+                Log("WARNING", $"    - Verify DirectRelay console shows 'Waiting for connections...'", ConsoleColor.Cyan);
+                Log("WARNING", $"    - Run: powershell -File diagnose.ps1 -FixFirewall", ConsoleColor.Cyan);
+                Log("WARNING", $"    - Check router port forwarding for UDP {portNum}", ConsoleColor.Cyan);
+                Console.WriteLine();
+                Console.Write("  Continue anyway? (y/N): ");
+                var answer = Console.ReadLine()?.Trim().ToLowerInvariant();
+                if (answer != "y" && answer != "yes")
+                {
+                    Log("STATUS", "Aborted by user", ConsoleColor.Yellow);
+                    WaitForExit();
+                    return;
+                }
+            }
         }
         catch (Exception ex)
         {
             Log("WARNING", $"  UDP test failed: {ex.Message}", ConsoleColor.Red);
             Log("WARNING", $"  This may indicate a firewall or routing issue", ConsoleColor.Red);
+        }
+
+        if (relayReachable)
+        {
+            Log("NETWORK", $"  Network connectivity: VERIFIED", ConsoleColor.Green);
         }
         Console.WriteLine();
 
@@ -544,6 +646,62 @@ class Program
         Console.Write($"[{tag,-10}] ");
         Console.ForegroundColor = prev;
         Console.WriteLine(msg);
+
+        // Also write to diagnostic log file
+        try
+        {
+            lock (_logLock)
+            {
+                _logFile?.WriteLine($"[{ts}] [{tag,-10}] {msg}");
+            }
+        }
+        catch { }
+    }
+
+    static void EnsureFirewallRule(int port)
+    {
+        try
+        {
+            // Check if rule already exists
+            var psi = new ProcessStartInfo
+            {
+                FileName = "netsh",
+                Arguments = $"advfirewall firewall show rule name=\"DirectRelayConnect UDP {port}\"",
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            var proc = Process.Start(psi);
+            proc?.WaitForExit(5000);
+            string output = proc?.StandardOutput.ReadToEnd() ?? "";
+
+            if (!output.Contains("DirectRelayConnect"))
+            {
+                Log("FIREWALL", $"Creating firewall rule for UDP port {port}...", ConsoleColor.Yellow);
+                var add = Process.Start(new ProcessStartInfo
+                {
+                    FileName = "netsh",
+                    Arguments = $"advfirewall firewall add rule name=\"DirectRelayConnect UDP {port}\" dir=in action=allow protocol=UDP localport={port}",
+                    UseShellExecute = true,
+                    Verb = "runas",
+                    CreateNoWindow = true
+                });
+                add?.WaitForExit(10000);
+
+                if (add?.ExitCode == 0)
+                    Log("FIREWALL", $"Firewall rule created for UDP {port} (inbound)", ConsoleColor.Green);
+                else
+                    Log("FIREWALL", $"Could not auto-create firewall rule (may need admin rights)", ConsoleColor.Yellow);
+            }
+            else
+            {
+                Log("FIREWALL", $"Firewall rule already exists for UDP {port}", ConsoleColor.Green);
+            }
+        }
+        catch (Exception ex)
+        {
+            Log("FIREWALL", $"Firewall check failed: {ex.Message} — you may need to manually allow UDP {port}", ConsoleColor.Yellow);
+        }
     }
 
     static void WaitForExit()

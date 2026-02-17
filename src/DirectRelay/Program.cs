@@ -14,6 +14,7 @@ using System.Windows.Forms;
 using LiteNetLib;
 using LiteNetLib.Utils;
 using Microsoft.Win32;
+using Open.Nat;
 
 namespace DirectRelay;
 
@@ -75,6 +76,10 @@ class Program
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool AttachConsole(int dwProcessId);
 
+    // File-based diagnostic log — every session writes to a file you can share
+    static StreamWriter? _logFile;
+    static readonly object _logLock = new();
+
     [STAThread]
     static async Task Main(string[] args)
     {
@@ -84,9 +89,27 @@ class Program
             AllocConsole();
         }
 
+        // Open diagnostic log file
+        try
+        {
+            string logPath = Path.Combine(AppContext.BaseDirectory, $"directrelay_{DateTime.Now:yyyyMMdd_HHmmss}.log");
+            _logFile = new StreamWriter(logPath, append: false) { AutoFlush = true };
+            _logFile.WriteLine($"=== DirectRelay Diagnostic Log - {DateTime.Now:yyyy-MM-dd HH:mm:ss} ===");
+            _logFile.WriteLine($"Machine: {Environment.MachineName} | User: {Environment.UserName} | OS: {Environment.OSVersion}");
+            _logFile.WriteLine($"LiteNetLib version: 0.9.5.2 (wire-protocol compatible with game mods)");
+            _logFile.WriteLine();
+        }
+        catch { }
+
         int port = 7777;
         if (args.Length > 0 && int.TryParse(args[0], out int p))
             port = p;
+
+        // === Auto-create Windows Firewall rule ===
+        EnsureFirewallRule(port);
+
+        // === UPnP automatic port forwarding (essential for internet play) ===
+        await TryUPnPPortForward(port);
 
         Console.Title = $"DirectRelay - Port {port}";
         Console.WriteLine("========================================================");
@@ -105,6 +128,39 @@ class Program
         Console.WriteLine("  Mode              : PRODUCTION (Optimized)");
 #endif
         Console.WriteLine("========================================================");
+        Console.WriteLine();
+
+        // === Show network info for the HOST ===
+        Log("NETWORK", "Detecting network addresses for your friend to connect...", ConsoleColor.Cyan);
+        try
+        {
+            var hostName = System.Net.Dns.GetHostName();
+            var addresses = System.Net.Dns.GetHostAddresses(hostName);
+            foreach (var addr in addresses)
+            {
+                if (addr.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork && !IPAddress.IsLoopback(addr))
+                {
+                    Log("NETWORK", $"  LAN IP: {addr} (only works if friend is on your same local network)", ConsoleColor.DarkGray);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Log("NETWORK", $"  Could not detect local IPs: {ex.Message}", ConsoleColor.Yellow);
+        }
+
+        // Try to get public IP — this is the one your friend needs for internet play
+        try
+        {
+            using var httpClient = new System.Net.Http.HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+            string publicIp = (await httpClient.GetStringAsync("https://api.ipify.org")).Trim();
+            Log("NETWORK", $"  *** PUBLIC IP: {publicIp} *** <- GIVE THIS TO YOUR FRIEND", ConsoleColor.Green);
+            Log("NETWORK", $"  Your friend enters this IP in DirectRelayConnect to join.", ConsoleColor.Cyan);
+        }
+        catch
+        {
+            Log("NETWORK", $"  Could not determine public IP (no internet or API down)", ConsoleColor.DarkYellow);
+        }
         Console.WriteLine();
 
         // === Launch GUI Control Panel ===
@@ -394,6 +450,132 @@ class Program
         Console.Write($"[{tag,-10}] ");
         Console.ForegroundColor = prev;
         Console.WriteLine(msg);
+
+        // Also write to diagnostic log file
+        try
+        {
+            lock (_logLock)
+            {
+                _logFile?.WriteLine($"[{ts}] [{tag,-10}] {msg}");
+            }
+        }
+        catch { }
+    }
+
+    static void EnsureFirewallRule(int port)
+    {
+        try
+        {
+            string exePath = Process.GetCurrentProcess().MainModule?.FileName ?? "";
+            
+            // Try to add firewall rule for both the exe and the port
+            var psi = new ProcessStartInfo
+            {
+                FileName = "netsh",
+                Arguments = $"advfirewall firewall show rule name=\"DirectRelay UDP {port}\"",
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            var proc = Process.Start(psi);
+            proc?.WaitForExit(5000);
+            string output = proc?.StandardOutput.ReadToEnd() ?? "";
+            
+            if (!output.Contains("DirectRelay"))
+            {
+                Log("FIREWALL", $"Creating firewall rule for UDP port {port}...", ConsoleColor.Yellow);
+                
+                // Add UDP inbound rule
+                var add = Process.Start(new ProcessStartInfo
+                {
+                    FileName = "netsh",
+                    Arguments = $"advfirewall firewall add rule name=\"DirectRelay UDP {port}\" dir=in action=allow protocol=UDP localport={port}",
+                    UseShellExecute = true,
+                    Verb = "runas",  // Request admin elevation
+                    CreateNoWindow = true
+                });
+                add?.WaitForExit(10000);
+                
+                if (add?.ExitCode == 0)
+                    Log("FIREWALL", $"Firewall rule created for UDP {port} (inbound)", ConsoleColor.Green);
+                else
+                    Log("FIREWALL", $"Could not auto-create firewall rule (may need admin rights)", ConsoleColor.Yellow);
+            }
+            else
+            {
+                Log("FIREWALL", $"Firewall rule already exists for UDP {port}", ConsoleColor.Green);
+            }
+        }
+        catch (Exception ex)
+        {
+            Log("FIREWALL", $"Firewall check failed: {ex.Message} — you may need to manually allow UDP {port}", ConsoleColor.Yellow);
+        }
+    }
+
+    /// <summary>
+    /// Attempts UPnP/NAT-PMP automatic port forwarding on the router.
+    /// This is ESSENTIAL for internet play — without it, players on different
+    /// networks cannot reach the relay server because the router drops the packets.
+    /// </summary>
+    static async Task TryUPnPPortForward(int port)
+    {
+        Log("UPNP", "Attempting automatic router port forwarding (UPnP)...", ConsoleColor.Yellow);
+        Log("UPNP", "This lets your friend connect from the internet without manual router config.", ConsoleColor.DarkCyan);
+        
+        try
+        {
+            var discoverer = new NatDiscoverer();
+            var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            var device = await discoverer.DiscoverDeviceAsync(PortMapper.Upnp | PortMapper.Pmp, cts);
+            
+            var externalIp = await device.GetExternalIPAsync();
+            Log("UPNP", $"Router found! External IP: {externalIp}", ConsoleColor.Green);
+            
+            // Check if mapping already exists
+            try
+            {
+                var existing = await device.GetSpecificMappingAsync(Protocol.Udp, port);
+                if (existing != null)
+                {
+                    Log("UPNP", $"Port mapping already exists: UDP {port} -> {existing.PrivateIP}:{existing.PrivatePort}", ConsoleColor.Green);
+                    Log("UPNP", $"Your friend should connect to: {externalIp}:{port}", ConsoleColor.Green);
+                    return;
+                }
+            }
+            catch { /* No existing mapping — we'll create one */ }
+            
+            // Create the port mapping (lifetime = 4 hours, auto-renew on next launch)
+            await device.CreatePortMapAsync(new Mapping(Protocol.Udp, port, port, 
+                14400, "DirectRelay Wukong Co-op"));
+            
+            Log("UPNP", $"*** PORT FORWARDING SUCCESSFUL! ***", ConsoleColor.Green);
+            Log("UPNP", $"UDP {port} is now forwarded through your router.", ConsoleColor.Green);
+            Log("UPNP", $"Tell your friend to connect to: {externalIp}:{port}", ConsoleColor.Cyan);
+        }
+        catch (NatDeviceNotFoundException)
+        {
+            Log("UPNP", "No UPnP/NAT-PMP router found.", ConsoleColor.Yellow);
+            Log("UPNP", "*** MANUAL PORT FORWARDING REQUIRED for internet play! ***", ConsoleColor.Red);
+            Log("UPNP", $"Steps to forward UDP port {port}:", ConsoleColor.Yellow);
+            Log("UPNP", $"  1. Open your router admin page (usually http://192.168.1.1 or http://192.168.0.1)", ConsoleColor.White);
+            Log("UPNP", $"  2. Find 'Port Forwarding' or 'Virtual Server' settings", ConsoleColor.White);
+            Log("UPNP", $"  3. Add rule: Protocol=UDP, External Port={port}, Internal Port={port}", ConsoleColor.White);
+            Log("UPNP", $"  4. Set Internal IP to THIS computer's LAN IP (shown above)", ConsoleColor.White);
+            Log("UPNP", $"  5. Save and restart the router if needed", ConsoleColor.White);
+            Log("UPNP", $"  Alternative: Some routers have a 'DMZ' option — set this PC as DMZ host", ConsoleColor.DarkGray);
+        }
+        catch (MappingException mex)
+        {
+            Log("UPNP", $"Router rejected port mapping: {mex.Message}", ConsoleColor.Yellow);
+            Log("UPNP", "*** MANUAL PORT FORWARDING REQUIRED ***", ConsoleColor.Red);
+            Log("UPNP", $"Forward UDP port {port} in your router settings to this PC's LAN IP.", ConsoleColor.Yellow);
+        }
+        catch (Exception ex)
+        {
+            Log("UPNP", $"UPnP failed: {ex.Message}", ConsoleColor.Yellow);
+            Log("UPNP", "*** You may need to manually forward the port for internet play. ***", ConsoleColor.Yellow);
+            Log("UPNP", $"Forward UDP port {port} in your router settings.", ConsoleColor.Yellow);
+        }
     }
 }
 
@@ -518,8 +700,8 @@ class DirectRelayServer : INetEventListener
             UnsyncedEvents = false,
             DisconnectTimeout = _config.Network.DisconnectTimeoutMs,
             UpdateTime = _config.Network.UpdateTimeMs,
-            IPv6Enabled = false,
-            UnconnectedMessagesEnabled = false,
+            IPv6Enabled = IPv6Mode.Disabled,
+            UnconnectedMessagesEnabled = true, // Enable for diagnostic echo
             NatPunchEnabled = false
         };
 #else
@@ -531,8 +713,8 @@ class DirectRelayServer : INetEventListener
             UnsyncedEvents = false,
             DisconnectTimeout = _config.Network.DisconnectTimeoutMs,
             UpdateTime = _config.Network.UpdateTimeMs, // 1ms for ultra-low latency
-            IPv6Enabled = false,
-            UnconnectedMessagesEnabled = false,
+            IPv6Enabled = IPv6Mode.Disabled,
+            UnconnectedMessagesEnabled = true, // Enable for diagnostic echo
             NatPunchEnabled = false
         };
 #endif
@@ -612,12 +794,14 @@ class DirectRelayServer : INetEventListener
         // The buffers are already set to reasonable defaults by LiteNetLib
 
         Log("NETWORK", $"UDP socket bound on port {_port} - ready for connections", ConsoleColor.Green);
+        Log("NETWORK", $"Diagnostic echo enabled — clients can test connectivity before connecting", ConsoleColor.Cyan);
 #if DIAGNOSTIC_MODE
         Log("NETWORK", $"Timeout: {_net.DisconnectTimeout}ms | PollRate: {_net.UpdateTime}ms | Stats: {_net.EnableStatistics}", ConsoleColor.Cyan);
 #else
         Log("NETWORK", $"Timeout: {_net.DisconnectTimeout}ms | PollRate: {_net.UpdateTime}ms | Production Mode", ConsoleColor.Cyan);
 #endif
         Log("STATUS", "Waiting for incoming connections...", ConsoleColor.DarkYellow);
+        Log("STATUS", "Tell your friend to run DirectRelayConnect.exe and enter your IP address", ConsoleColor.DarkYellow);
 
         while (!ct.IsCancellationRequested)
         {
@@ -670,7 +854,7 @@ class DirectRelayServer : INetEventListener
             var s = _net.Statistics;
             Log("NETSTATS", $"LiteNet: Sent={s.PacketsSent} Recv={s.PacketsReceived} " +
                 $"BytesSent={FormatBytes(s.BytesSent)} BytesRecv={FormatBytes(s.BytesReceived)} " +
-                $"PacketLoss={s.PacketLoss}", ConsoleColor.DarkGray);
+                $"Loss={s.PacketLoss}", ConsoleColor.DarkGray);
         }
     }
 
@@ -825,7 +1009,7 @@ class DirectRelayServer : INetEventListener
         }
     }
 
-    public void OnNetworkReceive(NetPeer peer, NetPacketReader reader, byte channel, DeliveryMethod dm)
+    public void OnNetworkReceive(NetPeer peer, NetPacketReader reader, DeliveryMethod dm)
     {
         // Atomic counters - no lock needed
         Interlocked.Increment(ref _totalPacketsReceived);
@@ -834,7 +1018,7 @@ class DirectRelayServer : INetEventListener
         if (reader.AvailableBytes == 0)
         {
 #if DIAGNOSTIC_MODE
-            Log("RECV", $"Empty packet from Peer {peer.Id} on ch={channel}", ConsoleColor.DarkYellow);
+            Log("RECV", $"Empty packet from Peer {peer.Id}", ConsoleColor.DarkYellow);
 #endif
             return;
         }
@@ -853,7 +1037,7 @@ class DirectRelayServer : INetEventListener
 
 #if DIAGNOSTIC_MODE
         // Detailed packet logging only in diagnostic mode
-        Log("RECV", $"Player {sender.PlayerId}: {GetMessageName(code)} ({reader.AvailableBytes}B) ch={channel} dm={dm}", ConsoleColor.Gray);
+        Log("RECV", $"Player {sender.PlayerId}: {GetMessageName(code)} ({reader.AvailableBytes}B) dm={dm}", ConsoleColor.Gray);
 #endif
 
         // Process packet without lock - safe for 2-player forwarding
@@ -896,6 +1080,32 @@ class DirectRelayServer : INetEventListener
 
     public void OnNetworkReceiveUnconnected(IPEndPoint ep, NetPacketReader r, UnconnectedMessageType t)
     {
+        // Diagnostic echo: respond to DIRECTRELAY_DIAG_PING with relay status
+        if (r.AvailableBytes >= 4)
+        {
+            string? msg = null;
+            try { msg = System.Text.Encoding.UTF8.GetString(r.RawData, r.Position, Math.Min(r.AvailableBytes, 64)); } catch { }
+            
+            if (msg != null && msg.StartsWith("DIRECTRELAY_DIAG"))
+            {
+                Log("DIAG", $"Diagnostic ping from {ep}", ConsoleColor.Cyan);
+                var uptime = DateTime.Now - _startTime;
+                var response = System.Text.Encoding.UTF8.GetBytes(
+                    $"DIRECTRELAY_DIAG_PONG|" +
+                    $"players={_byPlayerId.Count}|" +
+                    $"areas={_areas.Count}|" +
+                    $"uptime={uptime:hh\\:mm\\:ss}|" +
+                    $"port={_port}|" +
+                    $"version=1.0|" +
+                    $"pkts_in={_totalPacketsReceived}|" +
+                    $"pkts_out={_totalPacketsSent}");
+                var writer = new NetDataWriter();
+                writer.Put(response);
+                _net.SendUnconnectedMessage(writer, ep);
+                Log("DIAG", $"Diagnostic pong sent to {ep}", ConsoleColor.Green);
+                return;
+            }
+        }
         Log("UNCON", $"Unconnected message from {ep}: Type={t} ({r.AvailableBytes}B)", ConsoleColor.DarkYellow);
     }
 
@@ -1046,21 +1256,23 @@ class DirectRelayServer : INetEventListener
             return;
         }
 
-        // OPTIMIZATION: For 2-player co-op, use zero-copy direct forwarding
-        // This avoids allocating NetDataWriter and copying buffer data
+        // Direct forwarding: copy the relevant portion of the packet and send
         int sent = 0;
         
         // Calculate the position of the code byte (reader has already read it)
         // reader.Position now points after the code byte, so we go back 1 byte to include it
         int codeByteOffset = reader.Position - 1;
         int totalLength = reader.AvailableBytes + 1; // Remaining bytes + the code byte
+
+        // Copy the relevant portion so we can reuse it for all recipients
+        byte[] fwdBuf = new byte[totalLength];
+        Buffer.BlockCopy(reader.RawData, codeByteOffset, fwdBuf, 0, totalLength);
         
         foreach (var p in area.Players)
         {
             if (p.PlayerId != sender.PlayerId)
             {
-                // Zero-copy: Send raw buffer directly from the code byte position
-                p.Peer.Send(reader.RawData, codeByteOffset, totalLength, dm);
+                p.Peer.Send(fwdBuf, dm);
                 TrackSend(p, totalLength);
                 sent++;
             }
