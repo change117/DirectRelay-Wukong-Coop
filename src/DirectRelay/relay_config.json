@@ -1,8 +1,8 @@
 {
   "Network": {
     "Port": 7777,
-    "UpdateTimeMs": 1,
-    "DisconnectTimeoutMs": 30000,
+    "UpdateTimeMs": 5,
+    "DisconnectTimeoutMs": 5000,
     "SendBufferSizeKB": 1024,
     "ReceiveBufferSizeKB": 1024,
     "MTU": 1400
@@ -10,7 +10,7 @@
   "Performance": {
     "HighPriorityThread": true,
     "HighPriorityProcess": true,
-    "EnableStatistics": false
+    "EnableStatistics": true
   },
   "Diagnostics": {
     "LogPackets": false,

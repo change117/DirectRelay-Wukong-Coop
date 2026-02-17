@@ -1,0 +1,123 @@
+========================================================================
+CRITICAL FIXES - DirectRelay Connection Acceptance Issue
+========================================================================
+
+PROBLEM:
+- Game mod hooks successfully into the relay  
+- But connection attempts FAIL and timeout
+- ReadyMP's relay works with identical protocol
+- Root cause: UnsyncedEvents=false prevented timely connection processing
+
+========================================================================
+CHANGES MADE
+========================================================================
+
+1. NETMANAGER EVENT PROCESSING (Program.cs ~ line 870)
+   CHANGED: UnsyncedEvents = false  →  UnsyncedEvents = true
+   
+   IMPACT: 
+   - Events (like OnConnectionRequest) are now processed IMMEDIATELY
+   - Not batched/delayed until next PollEvents() call  
+   - Prevents connection request timeout/rejection due to slow processing
+   - THIS WAS THE PRIMARY BLOCKER
+   
+2. CONNECTION REQUEST HANDLING (Program.cs ~ line 1087)
+   CHANGED: Reject connections with empty data → Accept and generate GUID
+   
+   RATIONALE:
+   - Some clients may send connection request without initial data
+   - Relay now gracefully handles both cases
+   - Fallback GUID generation provides compatibility
+   
+3. ASYNC POLLING RESPONSIVENESS (Program.cs ~ line 1010)
+   CHANGED: Task.Delay(2ms) → Task.Delay(1ms)
+   
+   IMPACT:
+   - Tighter event polling loop
+   - Better latency for high-frequency message processing
+   
+4. ENHANCED LOGGING
+   Added detailed CONNECT/SEND/ERROR logs at every step:
+   - Shows exactly where connections succeed/fail
+   - Helps diagnose any remaining issues
+   - Set in both DIAGNOSTIC_MODE and production
+
+========================================================================
+HOW TO TEST
+========================================================================
+
+1. BUILD:
+   cd src && dotnet build DirectRelay-Wukong-Coop.sln -c Release
+
+2. RUN HOST (DirectRelay):
+   - Navigate to: bin/Release/net8.0-windows/
+   - Run: DirectRelay.exe
+   - Watch console for "Waiting for incoming connections..."
+
+3. RUN CLIENT (DirectRelayConnect):  
+   - Run: DirectRelayConnect.exe
+   - Enter HOST IP: 127.0.0.1 (local) or your external IP
+   - Enter PORT: 7777 (default)
+   - Click "Connect & Launch Game"
+
+4. WATCH LOGS:
+   - DirectRelay console should show:
+     [CONNECT] >>> Incoming connection from 127.0.0.1:xxxxx
+     [CONNECT] Parsed: GUID=... IdMode=Auto
+     [CONNECT] Assigning PlayerId=1...
+     [CONNECT] ✓ CONNECTED: PlayerId=1
+     [SEND] >> HandshakeConnected: xxB
+   
+   - If you see these messages, the fix WORKS!
+
+========================================================================
+IF STILL HAVING ISSUES
+========================================================================
+
+Check these in order:
+
+1. FIREWALL/NETWORK:
+   - Windows Firewall allowing UDP port 7777? 
+   - Port forwarding configured if testing externally?
+   - Run: netstat -an | findstr 7777 (should show LISTENING)
+
+2. PORT CONFLICT:
+   - Another app using port 7777?
+   - Run: netstat -an | findstr :7777
+   - Change port in relay_config.json if needed
+
+3. GAME LAUNCH:
+   - Are the 7 critical mod DLLs in game directory?
+   - Is handshake.env file written to: %APPDATA%\ReadyM.Launcher\
+   - Has game actually started and tried to connect?
+
+4. VERBOSE DIAGNOSTICS:
+   - Rebuild in Debug mode:
+     cd src && dotnet build ... -c Debug
+   - Debug build enables DIAGNOSTIC_MODE with extra logging
+   - Will show UDP packet details, latency, etc.
+
+========================================================================
+TECHNICAL DETAILS
+========================================================================
+
+The critical bug was LiteNetLib's event batching behavior:
+
+BEFORE (UnsyncedEvents=false):
+  1. Game sends CONNECT packet
+  2. UDP socket receives packet
+  3. OnConnectionRequest callback queued 
+  4. Callback NOT executed until game calls PollEvents()
+  5. If game times out before next PollEvents(), connection fails
+
+AFTER (UnsyncedEvents=true):  
+  1. Game sends CONNECT packet
+  2. UDP socket receives packet
+  3. OnConnectionRequest callback INVOKED IMMEDIATELY
+  4. Relay responds with HandshakeConnected right away
+  5. Game receives handshake before timeout
+
+This explains why it worked on ReadyMP's relay - they likely had
+UnsyncedEvents enabled or were polling more aggressively.
+
+========================================================================

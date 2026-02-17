@@ -29,8 +29,8 @@ class RelayConfig
 class NetworkConfig
 {
     public int Port { get; set; } = 7777;
-    public int UpdateTimeMs { get; set; } = 1;
-    public int DisconnectTimeoutMs { get; set; } = 30000;
+    public int UpdateTimeMs { get; set; } = 5;          // ReadyMP: Constants.ServerNetworkTickRateMs = 5
+    public int DisconnectTimeoutMs { get; set; } = 5000;  // ReadyMP: Constants.ClientConnectionTimeoutMs = 5000
     public int SendBufferSizeKB { get; set; } = 1024;
     public int ReceiveBufferSizeKB { get; set; } = 1024;
     public int MTU { get; set; } = 1400;
@@ -40,7 +40,7 @@ class PerformanceConfig
 {
     public bool HighPriorityThread { get; set; } = true;
     public bool HighPriorityProcess { get; set; } = true;
-    public bool EnableStatistics { get; set; } = false;
+    public bool EnableStatistics { get; set; } = true;   // ReadyMP: EnableStatistics = true always
 }
 
 class DiagnosticsConfig
@@ -873,33 +873,23 @@ class DirectRelayServer : INetEventListener
         // Load configuration file with defaults
         _config = LoadConfigInstance();
         
-#if DIAGNOSTIC_MODE
-        // In diagnostic mode, enable statistics
+        // NetManager config matched EXACTLY to ReadyMP's relay server settings:
+        //   AutoRecycle = true       — auto-recycle NetPacketReader after handler
+        //   EnableStatistics = true  — bandwidth statistics enabled
+        //   UnsyncedEvents = true    — fire events on receive thread immediately
+        //   PacketLayerBase = null   — NO encryption layer (constructor default)
+        //   DisconnectTimeout = 5000 — ReadyMP Constants.ClientConnectionTimeoutMs
+        //   UpdateTime = 5           — ReadyMP Constants.ServerNetworkTickRateMs
         _net = new NetManager(this)
         {
             AutoRecycle = true,
-            EnableStatistics = true,
-            UnsyncedEvents = false,
+            EnableStatistics = _config.Performance.EnableStatistics,
+            UnsyncedEvents = true,
             DisconnectTimeout = _config.Network.DisconnectTimeoutMs,
             UpdateTime = _config.Network.UpdateTimeMs,
             IPv6Enabled = IPv6Mode.Disabled,
-            UnconnectedMessagesEnabled = true, // Enable for diagnostic echo
-            NatPunchEnabled = false
+            UnconnectedMessagesEnabled = true
         };
-#else
-        // In production mode, disable statistics for maximum performance
-        _net = new NetManager(this)
-        {
-            AutoRecycle = true,
-            EnableStatistics = false, // No statistics overhead in production
-            UnsyncedEvents = false,
-            DisconnectTimeout = _config.Network.DisconnectTimeoutMs,
-            UpdateTime = _config.Network.UpdateTimeMs, // 1ms for ultra-low latency
-            IPv6Enabled = IPv6Mode.Disabled,
-            UnconnectedMessagesEnabled = true, // Enable for diagnostic echo
-            NatPunchEnabled = false
-        };
-#endif
     }
     
     RelayConfig LoadConfigInstance()
@@ -977,17 +967,14 @@ class DirectRelayServer : INetEventListener
 
         Log("NETWORK", $"UDP socket bound on port {_port} - ready for connections", ConsoleColor.Green);
         Log("NETWORK", $"Diagnostic echo enabled — clients can test connectivity before connecting", ConsoleColor.Cyan);
-#if DIAGNOSTIC_MODE
         Log("NETWORK", $"Timeout: {_net.DisconnectTimeout}ms | PollRate: {_net.UpdateTime}ms | Stats: {_net.EnableStatistics}", ConsoleColor.Cyan);
-#else
-        Log("NETWORK", $"Timeout: {_net.DisconnectTimeout}ms | PollRate: {_net.UpdateTime}ms | Production Mode", ConsoleColor.Cyan);
-#endif
 
         // === External port reachability test ===
         await Program.TestExternalPortReachability(_port);
 
         Log("STATUS", "Waiting for incoming connections...", ConsoleColor.DarkYellow);
         Log("STATUS", "Tell your friend to run DirectRelayConnect.exe and enter your IP address", ConsoleColor.DarkYellow);
+        Log("STATUS", $"Event processing mode: {((_net.UnsyncedEvents) ? "UNSYNC (immediate)" : "SYNC (batched)")}", ConsoleColor.Cyan);
 
         while (!ct.IsCancellationRequested)
         {
@@ -1000,7 +987,8 @@ class DirectRelayServer : INetEventListener
                 _lastStatusTime = DateTime.Now;
             }
 
-            await Task.Delay(2, ct).ConfigureAwait(false);
+            // ReadyMP server tick rate: Constants.ServerNetworkTickRateMs = 5
+            await Task.Delay(_config.Network.UpdateTimeMs, ct).ConfigureAwait(false);
         }
 
         Log("SHUTDOWN", $"Disconnecting {_byPlayerId.Count} player(s)...", ConsoleColor.Yellow);
@@ -1070,39 +1058,54 @@ class DirectRelayServer : INetEventListener
 
     // === INetEventListener ===
 
+    private string GetIdModeName(byte idMode) => idMode switch
+    {
+        0 => "Auto",
+        1 => "MinId",
+        2 => "ExactId",
+        _ => $"Unknown({idMode})"
+    };
+
     public void OnConnectionRequest(ConnectionRequest request)
     {
         Interlocked.Increment(ref _totalConnectionAttempts);
-        Log("CONNECT", $">>> Incoming connection request from {request.RemoteEndPoint}", ConsoleColor.Yellow);
+        Log("CONNECT", $">>> Incoming connection from {request.RemoteEndPoint}", ConsoleColor.Yellow);
 
         try
         {
             var reader = request.Data;
             int dataLen = reader.AvailableBytes;
-            Log("CONNECT", $"    Handshake data: {dataLen} bytes", ConsoleColor.Yellow);
+            Log("CONNECT", $"    Data available: {dataLen} bytes", ConsoleColor.DarkCyan);
 
-            if (dataLen == 0)
+            // CHANGED: Accept connections even without handshake data
+            Guid userGuid;
+            byte idMode = 0;  // Default: Auto
+            ushort reqId = 0;
+
+            if (dataLen > 0)
             {
-                Interlocked.Increment(ref _totalConnectionsRejected);
-                Log("REJECT", $"    REJECTED: Empty handshake data from {request.RemoteEndPoint}", ConsoleColor.Red);
-                request.Reject();
-                return;
+                try
+                {
+                    // Parse handshake if data is present
+                    string guidStr = reader.GetString();
+                    idMode = reader.GetByte();
+                    reqId = reader.GetUShort();
+                    userGuid = Guid.Parse(guidStr);
+                    Log("CONNECT", $"    Parsed: GUID={userGuid:N} IdMode={GetIdModeName(idMode)} ReqId={reqId}", ConsoleColor.DarkCyan);
+                }
+                catch (Exception ex)
+                {
+                    Log("CONNECT", $"    Handshake parse failed ({ex.GetType().Name}), using generated GUID", ConsoleColor.Yellow);
+                    userGuid = Guid.NewGuid();
+                    idMode = 0;
+                    reqId = 0;
+                }
             }
-
-            string guidStr = reader.GetString();
-            byte idMode = reader.GetByte();
-            ushort reqId = reader.GetUShort();
-            Guid userGuid = Guid.Parse(guidStr);
-
-            string modeStr = idMode switch
+            else
             {
-                0 => "Auto",
-                1 => "MinId",
-                2 => "ExactId",
-                _ => $"Unknown({idMode})"
-            };
-
-            Log("CONNECT", $"    GUID={userGuid}  IdMode={modeStr}  RequestedId={reqId}", ConsoleColor.Yellow);
+                Log("CONNECT", $"    No handshake data, generating temporary GUID", ConsoleColor.DarkCyan);
+                userGuid = Guid.NewGuid();
+            }
 
             lock (_lock)
             {
@@ -1119,7 +1122,10 @@ class DirectRelayServer : INetEventListener
                 if (id >= _nextPlayerId)
                     _nextPlayerId = (ushort)(id + 1);
 
+                Log("CONNECT", $"    Assigning PlayerId={id}...", ConsoleColor.DarkCyan);
                 var peer = request.Accept();
+                Log("CONNECT", $"    Peer registered: NetPeerId={peer.Id}", ConsoleColor.DarkCyan);
+                
                 var info = new PlayerInfo
                 {
                     Peer = peer,
@@ -1131,23 +1137,23 @@ class DirectRelayServer : INetEventListener
                 _byPlayerId[id] = info;
 
                 Interlocked.Increment(ref _totalConnectionsAccepted);
-                Log("CONNECT", $"    ACCEPTED: Player ID={id}  Peer={peer}  Total players now: {_byPlayerId.Count}", ConsoleColor.Green);
+                Log("CONNECT", $"    ✓ CONNECTED: PlayerId={id} | Peer {peer.Id} | GUID={userGuid:N}", ConsoleColor.Green);
 
                 // Send HandshakeConnected
                 var w = new NetDataWriter();
                 w.Put(MSG_HandshakeConnected);
-                w.Put(id);                   // PlayerId (ushort)
-                w.Put(_nextNetworkId);       // next NetworkId (uint)
+                w.Put(id);
+                w.Put(_nextNetworkId);
                 _nextNetworkId += 1000;
 
                 var others = _byPlayerId.Values.Where(x => x.PlayerId != id).ToList();
-                w.Put(others.Count);         // int
+                w.Put(others.Count);
                 foreach (var o in others)
-                    w.Put(o.PlayerId);       // ushort
+                    w.Put(o.PlayerId);
 
                 peer.Send(w, DeliveryMethod.ReliableOrdered);
                 TrackSend(info, w.Length);
-                Log("SEND", $"    -> HandshakeConnected to Player {id}: assigned NetworkId base={_nextNetworkId - 1000}, {others.Count} existing player(s)", ConsoleColor.DarkGreen);
+                Log("SEND", $"    >> HandshakeConnected: {w.Length}B to PlayerId={id} (base={_nextNetworkId - 1000}, {others.Count} others)", ConsoleColor.DarkGreen);
 
                 // Tell existing players about the new one
                 BroadcastPlayerConnection(id, true);
@@ -1156,8 +1162,13 @@ class DirectRelayServer : INetEventListener
         catch (Exception ex)
         {
             Interlocked.Increment(ref _totalConnectionsRejected);
-            Log("REJECT", $"    REJECTED from {request.RemoteEndPoint}: {ex.GetType().Name}: {ex.Message}", ConsoleColor.Red);
-            request.Reject();
+            Log("ERROR", $"Connection from {request.RemoteEndPoint} failed: {ex.GetType().Name}: {ex.Message}", ConsoleColor.Red);
+            Log("DEBUG", $"Stack: {ex.StackTrace?.Split('\n').FirstOrDefault() ?? "(unknown)"}", ConsoleColor.DarkRed);
+            try
+            {
+                request.Reject();
+            }
+            catch { }
         }
     }
 
@@ -1484,12 +1495,10 @@ class DirectRelayServer : INetEventListener
         }
 
         int hdrStart = reader.Position;
-        byte mode = reader.GetByte();
+        // CustomRelayEventHeader wire format: [ushort senderPlayerId] [byte relayMode] [optional peers]
+        // CRITICAL: senderId comes BEFORE mode — was previously swapped!
         ushort senderId = reader.GetUShort();
-
-#if DIAGNOSTIC_MODE
-        string modeName = ModeNames.TryGetValue(mode, out var mn) ? mn : $"Unknown({mode})";
-#endif
+        byte mode = reader.GetByte();
 
         ushort[]? targets = null;
         if (mode == MODE_Peers)
@@ -1501,12 +1510,14 @@ class DirectRelayServer : INetEventListener
         }
 
 #if DIAGNOSTIC_MODE
-        Log("RPC", $"Player {sender.PlayerId}: RPC({code}) mode={modeName} " +
+        string modeName = ModeNames.TryGetValue(mode, out var mn) ? mn : $"Unknown({mode})";
+        Log("RPC", $"Player {sender.PlayerId}: RPC({code}) sender={senderId} mode={modeName} " +
             (targets != null ? $"targets=[{string.Join(",", targets)}]" : "") +
-            $" ({reader.AvailableBytes}B)", ConsoleColor.DarkCyan);
+            $" ({reader.AvailableBytes}B payload)", ConsoleColor.DarkCyan);
 #endif
 
-        // Use pooled writer to eliminate allocations
+        // Reconstruct the complete original message for forwarding:
+        // [byte eventCode] + [everything from hdrStart to end] = original wire format
         var w = NetDataWriterPool.Rent();
         try
         {
