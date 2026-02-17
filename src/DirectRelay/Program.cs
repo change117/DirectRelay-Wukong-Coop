@@ -522,6 +522,18 @@ class Program
         Log("UPNP", "Attempting automatic router port forwarding (UPnP)...", ConsoleColor.Yellow);
         Log("UPNP", "This lets your friend connect from the internet without manual router config.", ConsoleColor.DarkCyan);
         
+        // Detect this machine's LAN IP (used in all code paths)
+        string localIp = "unknown";
+        try
+        {
+            using var tempSocket = new System.Net.Sockets.Socket(
+                System.Net.Sockets.AddressFamily.InterNetwork,
+                System.Net.Sockets.SocketType.Dgram, 0);
+            tempSocket.Connect("8.8.8.8", 65530);
+            localIp = ((IPEndPoint)tempSocket.LocalEndPoint!).Address.ToString();
+        }
+        catch { }
+
         try
         {
             var discoverer = new NatDiscoverer();
@@ -537,16 +549,57 @@ class Program
                 var existing = await device.GetSpecificMappingAsync(Protocol.Udp, port);
                 if (existing != null)
                 {
-                    Log("UPNP", $"Port mapping already exists: UDP {port} -> {existing.PrivateIP}:{existing.PrivatePort}", ConsoleColor.Green);
-                    Log("UPNP", $"Your friend should connect to: {externalIp}:{port}", ConsoleColor.Green);
-                    return;
+                    // Check if the existing mapping points to THIS machine
+                    if (existing.PrivateIP.ToString() == localIp && existing.PrivatePort == port)
+                    {
+                        Log("UPNP", $"Port mapping already exists for this PC: UDP {port} -> {existing.PrivateIP}:{existing.PrivatePort}", ConsoleColor.Green);
+                        Log("UPNP", $"*** PORT FORWARDING OK ***", ConsoleColor.Green);
+                        Log("UPNP", $"Tell your friend to connect to: {externalIp}:{port}", ConsoleColor.Cyan);
+                        return;
+                    }
+                    else
+                    {
+                        // Mapping exists but for a different IP/port — stale entry, delete it
+                        Log("UPNP", $"Stale port mapping found: UDP {port} -> {existing.PrivateIP}:{existing.PrivatePort} (not this PC: {localIp})", ConsoleColor.Yellow);
+                        Log("UPNP", $"Removing stale mapping and recreating for this PC...", ConsoleColor.Yellow);
+                        await device.DeletePortMapAsync(existing);
+                        Log("UPNP", $"Stale mapping removed.", ConsoleColor.Green);
+                    }
                 }
             }
             catch { /* No existing mapping — we'll create one */ }
             
             // Create the port mapping (lifetime = 4 hours, auto-renew on next launch)
-            await device.CreatePortMapAsync(new Mapping(Protocol.Udp, port, port, 
-                14400, "DirectRelay Wukong Co-op"));
+            try
+            {
+                await device.CreatePortMapAsync(new Mapping(Protocol.Udp, port, port, 
+                    14400, "DirectRelay Wukong Co-op"));
+            }
+            catch (MappingException mex) when (mex.Message.Contains("718") || mex.Message.Contains("Conflict"))
+            {
+                // ConflictInMappingEntry — try to force-delete and retry
+                Log("UPNP", $"Conflict detected, attempting to remove old mapping and retry...", ConsoleColor.Yellow);
+                try
+                {
+                    // Delete by creating a mapping object that matches the external port
+                    await device.DeletePortMapAsync(new Mapping(Protocol.Udp, port, port, 0, ""));
+                    await Task.Delay(500); // Brief pause for router to process
+                    await device.CreatePortMapAsync(new Mapping(Protocol.Udp, port, port, 
+                        14400, "DirectRelay Wukong Co-op"));
+                }
+                catch (Exception retryEx)
+                {
+                    Log("UPNP", $"Could not resolve conflict automatically: {retryEx.Message}", ConsoleColor.Yellow);
+                    Log("UPNP", "*** MANUAL PORT FORWARDING REQUIRED ***", ConsoleColor.Red);
+                    Log("UPNP", $"Your router has a conflicting port mapping for UDP {port}.", ConsoleColor.Yellow);
+                    Log("UPNP", $"To fix this:", ConsoleColor.White);
+                    Log("UPNP", $"  1. Open your router admin page (usually http://192.168.1.1)", ConsoleColor.White);
+                    Log("UPNP", $"  2. Delete any existing port forwarding/UPnP rule for port {port}", ConsoleColor.White);
+                    Log("UPNP", $"  3. Add new rule: Protocol=UDP, External Port={port}, Internal IP={localIp}, Internal Port={port}", ConsoleColor.White);
+                    Log("UPNP", $"  4. Or restart the router to clear stale UPnP entries, then re-run DirectRelay", ConsoleColor.White);
+                    return;
+                }
+            }
             
             Log("UPNP", $"*** PORT FORWARDING SUCCESSFUL! ***", ConsoleColor.Green);
             Log("UPNP", $"UDP {port} is now forwarded through your router.", ConsoleColor.Green);
@@ -566,9 +619,23 @@ class Program
         }
         catch (MappingException mex)
         {
-            Log("UPNP", $"Router rejected port mapping: {mex.Message}", ConsoleColor.Yellow);
-            Log("UPNP", "*** MANUAL PORT FORWARDING REQUIRED ***", ConsoleColor.Red);
-            Log("UPNP", $"Forward UDP port {port} in your router settings to this PC's LAN IP.", ConsoleColor.Yellow);
+            if (mex.Message.Contains("718") || mex.Message.Contains("Conflict"))
+            {
+                // Error 718 = ConflictInMappingEntry — a rule already exists for this port
+                // This is usually FINE if you have a manual port forward set up
+                Log("UPNP", $"UPnP auto-create skipped: a port mapping for {port} already exists in your router.", ConsoleColor.Yellow);
+                Log("UPNP", $"If you have manually set up port forwarding for UDP {port}, this is normal and OK.", ConsoleColor.Green);
+                Log("UPNP", $"If connectivity still fails, check that your router's port forward rule is ENABLED", ConsoleColor.Yellow);
+                Log("UPNP", $"  and points to this PC's LAN IP: {localIp}", ConsoleColor.Yellow);
+            }
+            else
+            {
+                Log("UPNP", $"Router rejected port mapping: {mex.Message}", ConsoleColor.Yellow);
+                Log("UPNP", "*** MANUAL PORT FORWARDING REQUIRED ***", ConsoleColor.Red);
+                Log("UPNP", $"Forward UDP port {port} in your router settings to this PC's LAN IP ({localIp}).", ConsoleColor.Yellow);
+                Log("UPNP", $"  Tip: Open your router admin page and delete any existing UPnP/port-forward", ConsoleColor.White);
+                Log("UPNP", $"  rules for port {port}, then re-run DirectRelay.", ConsoleColor.White);
+            }
         }
         catch (Exception ex)
         {
@@ -576,6 +643,121 @@ class Program
             Log("UPNP", "*** You may need to manually forward the port for internet play. ***", ConsoleColor.Yellow);
             Log("UPNP", $"Forward UDP port {port} in your router settings.", ConsoleColor.Yellow);
         }
+    }
+
+    /// <summary>
+    /// Lists all network interfaces and their IPs, then performs a self-test
+    /// by sending a UDP packet to ourselves via the public IP to verify port forwarding.
+    /// </summary>
+    internal static async Task TestExternalPortReachability(int port)
+    {
+        Console.WriteLine();
+        Log("PORTTEST", "=== Port Reachability Self-Test ===", ConsoleColor.Cyan);
+
+        // 1. List all network interfaces
+        Log("PORTTEST", "Network interfaces on this machine:", ConsoleColor.Cyan);
+        try
+        {
+            foreach (var nic in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces())
+            {
+                if (nic.OperationalStatus != System.Net.NetworkInformation.OperationalStatus.Up)
+                    continue;
+                
+                var ipProps = nic.GetIPProperties();
+                var ipv4Addrs = ipProps.UnicastAddresses
+                    .Where(a => a.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+                    .Select(a => a.Address.ToString())
+                    .ToList();
+                
+                if (ipv4Addrs.Count == 0) continue;
+                
+                string nicType = nic.NetworkInterfaceType.ToString();
+                string ips = string.Join(", ", ipv4Addrs);
+                Log("PORTTEST", $"  [{nicType}] {nic.Name}: {ips}", ConsoleColor.DarkCyan);
+            }
+        }
+        catch (Exception ex)
+        {
+            Log("PORTTEST", $"  Could not enumerate interfaces: {ex.Message}", ConsoleColor.Yellow);
+        }
+        Console.WriteLine();
+
+        // 2. Get public IP
+        string? publicIp = null;
+        try
+        {
+            using var httpClient = new System.Net.Http.HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+            publicIp = (await httpClient.GetStringAsync("https://api.ipify.org")).Trim();
+        }
+        catch { }
+
+        if (string.IsNullOrEmpty(publicIp))
+        {
+            Log("PORTTEST", "Could not determine public IP — skipping external reachability test.", ConsoleColor.Yellow);
+            Console.WriteLine();
+            return;
+        }
+
+        // 3. Self-test: Send a UDP ping to our own public IP and see if the relay echoes it back
+        Log("PORTTEST", $"Testing if UDP port {port} is reachable at your public IP {publicIp}...", ConsoleColor.Yellow);
+        Log("PORTTEST", $"  (Sending a test packet to {publicIp}:{port} — should loop back through router)", ConsoleColor.DarkGray);
+
+        try
+        {
+            using var testUdp = new UdpClient();
+            testUdp.Client.ReceiveTimeout = 4000;
+            testUdp.Client.SendTimeout = 2000;
+
+            byte[] pingData = System.Text.Encoding.UTF8.GetBytes("DIRECTRELAY_DIAG_PING_SELFTEST");
+            testUdp.Send(pingData, pingData.Length, publicIp, port);
+
+            try
+            {
+                var remoteEp = new IPEndPoint(IPAddress.Any, 0);
+                byte[] response = testUdp.Receive(ref remoteEp);
+                string responseStr = System.Text.Encoding.UTF8.GetString(response);
+
+                if (responseStr.Contains("DIRECTRELAY_DIAG_PONG"))
+                {
+                    Log("PORTTEST", $"*** PORT {port} IS REACHABLE FROM THE INTERNET! ***", ConsoleColor.Green);
+                    Log("PORTTEST", $"  Your friend can connect to {publicIp}:{port}", ConsoleColor.Green);
+                    Log("PORTTEST", $"  Port forwarding is WORKING correctly.", ConsoleColor.Green);
+                }
+                else
+                {
+                    Log("PORTTEST", $"  Got a response ({response.Length} bytes) but not from our relay.", ConsoleColor.Yellow);
+                    Log("PORTTEST", $"  Port may be reachable but something else is responding.", ConsoleColor.Yellow);
+                }
+            }
+            catch (SocketException sex) when (sex.SocketErrorCode == SocketError.TimedOut)
+            {
+                Log("PORTTEST", $"*** PORT {port} IS NOT REACHABLE FROM YOUR PUBLIC IP ***", ConsoleColor.Red);
+                Log("PORTTEST", $"  No response from {publicIp}:{port} within 4 seconds.", ConsoleColor.Red);
+                Log("PORTTEST", $"", ConsoleColor.Red);
+                Log("PORTTEST", $"  This means your friend CANNOT connect to you right now.", ConsoleColor.Red);
+                Log("PORTTEST", $"  Possible causes:", ConsoleColor.Yellow);
+                Log("PORTTEST", $"    1. Port forwarding rule is not enabled in your router", ConsoleColor.Yellow);
+                Log("PORTTEST", $"    2. Port forward rule points to wrong LAN IP", ConsoleColor.Yellow);
+                Log("PORTTEST", $"    3. Windows Firewall is blocking inbound UDP {port}", ConsoleColor.Yellow);
+                Log("PORTTEST", $"    4. Antivirus/security software is blocking the port", ConsoleColor.Yellow);
+                Log("PORTTEST", $"    5. ISP is blocking inbound UDP traffic (rare but possible)", ConsoleColor.Yellow);
+                Log("PORTTEST", $"    6. Router needs a reboot after adding port forward rules", ConsoleColor.Yellow);
+                Console.WriteLine();
+                Log("PORTTEST", $"  Quick fixes to try:", ConsoleColor.Cyan);
+                Log("PORTTEST", $"    - Reboot your router", ConsoleColor.White);
+                Log("PORTTEST", $"    - Temporarily disable Windows Firewall to test", ConsoleColor.White);
+                Log("PORTTEST", $"    - Temporarily disable antivirus to test", ConsoleColor.White);
+                Log("PORTTEST", $"    - Try setting this PC as DMZ host in router", ConsoleColor.White);
+                Log("PORTTEST", $"    - Some routers can't hairpin (self-test may fail but friend can still connect)", ConsoleColor.DarkGray);
+            }
+        }
+        catch (Exception ex)
+        {
+            Log("PORTTEST", $"  Self-test failed: {ex.Message}", ConsoleColor.Yellow);
+            Log("PORTTEST", $"  Note: Some routers don't support hairpin NAT (testing your own public IP).", ConsoleColor.DarkGray);
+            Log("PORTTEST", $"  The port may still work for external clients — ask your friend to test.", ConsoleColor.DarkGray);
+        }
+        Console.WriteLine();
     }
 }
 
@@ -800,6 +982,10 @@ class DirectRelayServer : INetEventListener
 #else
         Log("NETWORK", $"Timeout: {_net.DisconnectTimeout}ms | PollRate: {_net.UpdateTime}ms | Production Mode", ConsoleColor.Cyan);
 #endif
+
+        // === External port reachability test ===
+        await Program.TestExternalPortReachability(_port);
+
         Log("STATUS", "Waiting for incoming connections...", ConsoleColor.DarkYellow);
         Log("STATUS", "Tell your friend to run DirectRelayConnect.exe and enter your IP address", ConsoleColor.DarkYellow);
 
