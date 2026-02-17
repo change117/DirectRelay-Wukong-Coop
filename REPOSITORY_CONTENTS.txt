@@ -1,0 +1,141 @@
+═══════════════════════════════════════════════════════════════════════════
+  DirectRelay-Wukong-Coop Repository - Complete Contents
+═══════════════════════════════════════════════════════════════════════════
+
+✅ READY-TO-USE APPLICATIONS (No building required!)
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│  HOST/ - For Game Hosting (164 MB total)                               │
+├─────────────────────────────────────────────────────────────────────────┤
+│  📄 DirectRelay.exe ................ 65 MB │ Main executable           │
+│  �� DirectRelay.pdb ................ 15 KB │ Debug symbols             │
+│  📄 diagnose.ps1 .................... 9 KB │ Troubleshooting script    │
+│  📁 mods/ ....................... ~99 MB │ 8 game mod files          │
+│     └── (Auto-installed to game directory)                             │
+└─────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│  CLIENT/ - For Joining Games (165 MB total)                            │
+├─────────────────────────────────────────────────────────────────────────┤
+│  📄 DirectRelayConnect.exe ......... 65 MB │ Main executable           │
+│  📄 DirectRelayConnect.pdb ......... 13 KB │ Debug symbols             │
+│  📄 diagnose.ps1 ................... 10 KB │ Troubleshooting script    │
+│  📁 mods/ ....................... ~100 MB │ 8 game mod files          │
+│     └── (Auto-installed to game directory)                             │
+└─────────────────────────────────────────────────────────────────────────┘
+
+📚 DOCUMENTATION
+
+  📖 README.md ........................ Main project documentation
+  📖 QUICK_START.md ................... Fast setup guide
+  📖 DOWNLOAD_INSTRUCTIONS.md ......... Detailed download guide
+  📖 BUILD_SUMMARY.md ................. Technical build information
+  📖 REPOSITORY_CONTENTS.txt .......... This file
+
+🔧 SOURCE CODE (For developers - optional)
+
+  📁 src/ .............................. Source code directory
+     ├── DirectRelay/ ................. HOST application source
+     ├── DirectRelayConnect/ .......... CLIENT application source
+     └── DirectRelay-Wukong-Coop.sln .. Visual Studio solution
+
+📂 DOCUMENTATION & REFERENCES
+
+  📁 docs/ ............................. Additional documentation
+     └── decompiled/ ................... ReadyMP mod reference
+
+🛠️ UTILITIES
+
+  📄 diagnose.ps1 ...................... PowerShell diagnostic script
+
+═══════════════════════════════════════════════════════════════════════════
+  DOWNLOAD OPTIONS
+═══════════════════════════════════════════════════════════════════════════
+
+Option 1: ZIP Download (No tools required)
+  → Visit: https://github.com/change117/DirectRelay-Wukong-Coop
+  → Click "Code" → "Download ZIP"
+  → Extract and use HOST/ or CLIENT/ folders
+
+Option 2: Git Clone
+  → git clone https://github.com/change117/DirectRelay-Wukong-Coop.git
+
+═══════════════════════════════════════════════════════════════════════════
+  SYSTEM REQUIREMENTS
+═══════════════════════════════════════════════════════════════════════════
+
+Operating System:  Windows 10/11 (64-bit)
+Memory (RAM):      4 GB minimum
+Disk Space:        ~200 MB for application + mods
+Network:           Internet connection for online play
+.NET Runtime:      NOT REQUIRED (included in executables)
+
+═══════════════════════════════════════════════════════════════════════════
+  KEY FEATURES
+═══════════════════════════════════════════════════════════════════════════
+
+✅ Self-contained executables (no .NET installation needed)
+✅ Automatic mod installation to game directory
+✅ Save game backup/restore functionality
+✅ Built-in UPnP port forwarding
+✅ Network diagnostics and troubleshooting
+✅ GUI control panel for easy management
+✅ Direct relay - no third-party launchers required
+
+═══════════════════════════════════════════════════════════════════════════
+  GETTING STARTED
+═══════════════════════════════════════════════════════════════════════════
+
+FOR HOST (Person running the server):
+  1. Navigate to HOST/ folder
+  2. Double-click DirectRelay.exe
+  3. GUI control panel appears
+  4. Click "Launch Game & Start Server"
+  5. Share your IP address with your friend
+
+FOR CLIENT (Person joining):
+  1. Navigate to CLIENT/ folder
+  2. Double-click DirectRelayConnect.exe
+  3. Enter host's IP address when prompted
+  4. Click connect
+  5. Game launches automatically
+
+═══════════════════════════════════════════════════════════════════════════
+  TROUBLESHOOTING
+═══════════════════════════════════════════════════════════════════════════
+
+Issue: "Windows protected your PC" warning
+  → This is normal for unsigned executables
+  → Click "More info" → "Run anyway"
+
+Issue: Connection problems
+  → Run diagnose.ps1 in the appropriate folder
+  → Check firewall settings (allow DirectRelay.exe)
+  → Ensure port 7777 is open (for HOST)
+
+Issue: Game won't launch
+  → Verify Black Myth: Wukong is installed
+  → Check game installation path is accessible
+  → Try running as Administrator
+
+═══════════════════════════════════════════════════════════════════════════
+  SUMMARY
+═══════════════════════════════════════════════════════════════════════════
+
+Your repository ALREADY CONTAINS built executables ready to use!
+
+NO BUILDING REQUIRED - Just download and run!
+
+Total Download Size: ~350 MB (including mods)
+Last Updated:        February 17, 2026
+Framework:           .NET 8.0 (included)
+Build Type:          Release (optimized)
+
+═══════════════════════════════════════════════════════════════════════════
+
+Questions? Open an issue at:
+https://github.com/change117/DirectRelay-Wukong-Coop/issues
+
+Enjoy playing Black Myth: Wukong with your friends! 🎮🐵
+
+═══════════════════════════════════════════════════════════════════════════
