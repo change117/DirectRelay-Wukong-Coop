@@ -7,6 +7,8 @@ using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Windows.Forms;
+using LiteNetLib;
+using LiteNetLib.Utils;
 using Microsoft.Win32;
 
 namespace DirectRelayConnect;
@@ -164,71 +166,67 @@ class Program
             return;
         }
 
-        // UDP reachability test — send diagnostic ping to relay and wait for pong
+        // UDP reachability test — send LiteNetLib-formatted diagnostic ping
         Log("NETWORK", $"  Sending diagnostic ping to relay at {hostIp}:{portNum}...", ConsoleColor.Yellow);
         bool relayReachable = false;
         try
         {
-            using var udp = new UdpClient();
-            udp.Client.ReceiveTimeout = 3000;
-            udp.Client.SendTimeout = 3000;
-            udp.Connect(hostIp, portNum);
-            var localEp = (IPEndPoint)udp.Client.LocalEndPoint!;
-            Log("NETWORK", $"  UDP socket OK - local endpoint: {localEp}", ConsoleColor.Green);
-
-            // Send diagnostic ping (the relay echoes these back with status info)
-            byte[] pingData = System.Text.Encoding.UTF8.GetBytes("DIRECTRELAY_DIAG_PING");
-            udp.Send(pingData, pingData.Length);
-            Log("NETWORK", $"  Diagnostic ping sent, waiting for relay response...", ConsoleColor.Yellow);
-
-            try
+            // Use LiteNetLib to send the diagnostic ping so it arrives as a proper
+            // unconnected message that the relay's OnNetworkReceiveUnconnected can handle.
+            // Raw UDP (UdpClient.Send) doesn't have the LiteNetLib packet header, so the
+            // relay's LiteNetLib would silently drop it.
+            var diagListener = new DiagPingListener();
+            var diagNet = new NetManager(diagListener)
             {
-                var remoteEp = new IPEndPoint(IPAddress.Any, 0);
-                byte[] response = udp.Receive(ref remoteEp);
-                string responseStr = System.Text.Encoding.UTF8.GetString(response);
+                UnconnectedMessagesEnabled = true,
+                AutoRecycle = true
+            };
+            diagNet.Start();
+            Log("NETWORK", $"  LiteNetLib diagnostic socket started on port {diagNet.LocalPort}", ConsoleColor.DarkGray);
 
-                // LiteNetLib wraps the data — skip the first 4 bytes (length prefix from Put(byte[]))
-                // The relay sends: writer.Put(byte[]) which prefixes with int32 length
-                if (response.Length > 4)
-                {
-                    // Try to find the DIRECTRELAY_DIAG_PONG marker
-                    string fullResponse = System.Text.Encoding.UTF8.GetString(response);
-                    int pongIdx = fullResponse.IndexOf("DIRECTRELAY_DIAG_PONG");
-                    if (pongIdx >= 0)
-                    {
-                        string pongData = fullResponse.Substring(pongIdx);
-                        relayReachable = true;
-                        Log("NETWORK", $"  *** RELAY IS ALIVE AND RESPONDING! ***", ConsoleColor.Green);
+            var pingPayload = System.Text.Encoding.UTF8.GetBytes("DIRECTRELAY_DIAG_PING");
+            var writer = new NetDataWriter();
+            writer.Put(pingPayload);
+            
+            var targetEp = new IPEndPoint(IPAddress.Parse(hostIp), portNum);
+            diagNet.SendUnconnectedMessage(writer, targetEp);
+            Log("NETWORK", $"  Diagnostic ping sent (LiteNetLib format), waiting for relay response...", ConsoleColor.Yellow);
 
-                        // Parse pong fields
-                        var fields = pongData.Split('|');
-                        foreach (var field in fields)
-                        {
-                            if (field.StartsWith("players="))
-                                Log("NETWORK", $"    Players connected: {field.Split('=')[1]}", ConsoleColor.Cyan);
-                            else if (field.StartsWith("uptime="))
-                                Log("NETWORK", $"    Relay uptime: {field.Split('=')[1]}", ConsoleColor.Cyan);
-                            else if (field.StartsWith("areas="))
-                                Log("NETWORK", $"    Active areas: {field.Split('=')[1]}", ConsoleColor.Cyan);
-                            else if (field.StartsWith("pkts_in="))
-                                Log("NETWORK", $"    Packets received: {field.Split('=')[1]}", ConsoleColor.DarkCyan);
-                            else if (field.StartsWith("pkts_out="))
-                                Log("NETWORK", $"    Packets sent: {field.Split('=')[1]}", ConsoleColor.DarkCyan);
-                        }
-                    }
-                    else
-                    {
-                        Log("NETWORK", $"  Got response ({response.Length} bytes) but not a diagnostic pong", ConsoleColor.Yellow);
-                        Log("NETWORK", $"  The relay may be an older version without diagnostic echo", ConsoleColor.DarkGray);
-                    }
-                }
-                else
+            // Poll for up to 3 seconds waiting for the pong
+            var sw = Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < 3000 && !diagListener.GotPong)
+            {
+                diagNet.PollEvents();
+                Thread.Sleep(10);
+            }
+
+            diagNet.Stop();
+
+            if (diagListener.GotPong)
+            {
+                relayReachable = true;
+                Log("NETWORK", $"  *** RELAY IS ALIVE AND RESPONDING! ***", ConsoleColor.Green);
+
+                // Parse pong fields
+                if (diagListener.PongData != null)
                 {
-                    Log("NETWORK", $"  Got response ({response.Length} bytes), relay is reachable", ConsoleColor.Green);
-                    relayReachable = true;
+                    var fields = diagListener.PongData.Split('|');
+                    foreach (var field in fields)
+                    {
+                        if (field.StartsWith("players="))
+                            Log("NETWORK", $"    Players connected: {field.Split('=')[1]}", ConsoleColor.Cyan);
+                        else if (field.StartsWith("uptime="))
+                            Log("NETWORK", $"    Relay uptime: {field.Split('=')[1]}", ConsoleColor.Cyan);
+                        else if (field.StartsWith("areas="))
+                            Log("NETWORK", $"    Active areas: {field.Split('=')[1]}", ConsoleColor.Cyan);
+                        else if (field.StartsWith("pkts_in="))
+                            Log("NETWORK", $"    Packets received: {field.Split('=')[1]}", ConsoleColor.DarkCyan);
+                        else if (field.StartsWith("pkts_out="))
+                            Log("NETWORK", $"    Packets sent: {field.Split('=')[1]}", ConsoleColor.DarkCyan);
+                    }
                 }
             }
-            catch (SocketException sex) when (sex.SocketErrorCode == SocketError.TimedOut)
+            else
             {
                 Log("WARNING", $"  *** NO RESPONSE FROM RELAY within 3 seconds ***", ConsoleColor.Red);
                 Log("WARNING", $"  This usually means one of:", ConsoleColor.Red);
@@ -314,8 +312,42 @@ class Program
 
         // === STEP 3: Auto-install ReadyMP mod files ===
         Log("MOD", "Installing ReadyMP mod files to game directory...", ConsoleColor.Yellow);
-        string gameDir = Path.GetDirectoryName(gamePath)!;
-        Log("MOD", $"  Game dir: {gameDir}", ConsoleColor.DarkGray);
+
+        // Path layout: {install}/b1/Binaries/Win64/b1-Win64-Shipping.exe
+        string win64Dir = Path.GetDirectoryName(gamePath)!;
+        // Navigate up to game install root (Win64 -> Binaries -> b1 -> root)
+        string gameInstallRoot = Path.GetFullPath(Path.Combine(win64Dir, "..", "..", ".."));
+        // CSharpLoader mod directory: Win64/CSharpLoader/Mods/WukongMp.Coop/
+        string csLoaderModsDir = Path.Combine(win64Dir, "CSharpLoader", "Mods");
+        string coopModDir = Path.Combine(csLoaderModsDir, "WukongMp.Coop");
+
+        Log("MOD", $"  Win64 dir      : {win64Dir}", ConsoleColor.DarkGray);
+        Log("MOD", $"  Install root   : {gameInstallRoot}", ConsoleColor.DarkGray);
+        Log("MOD", $"  Mod target dir : {coopModDir}", ConsoleColor.DarkGray);
+
+        // --- Check for CSharpLoader (the mod framework) ---
+        string dwmapiPath = Path.Combine(win64Dir, "dwmapi.dll");
+        if (!File.Exists(dwmapiPath))
+        {
+            Log("MOD", "", ConsoleColor.Red);
+            Log("MOD", "*** CRITICAL: CSharpLoader (dwmapi.dll) NOT FOUND ***", ConsoleColor.Red);
+            Log("MOD", "  The CSharpLoader mod framework MUST be installed for co-op to work.", ConsoleColor.Red);
+            Log("MOD", "  Without it, the game cannot load the WukongMp.Coop mod DLLs.", ConsoleColor.Red);
+            Log("MOD", "", ConsoleColor.Yellow);
+            Log("MOD", "  TO FIX — Install CSharpLoader for Black Myth: Wukong:", ConsoleColor.Yellow);
+            Log("MOD", "    Option A: Run the ReadyMP Launcher ONCE (free download at readymp.com)", ConsoleColor.Yellow);
+            Log("MOD", "             It auto-installs CSharpLoader, then you can close it.", ConsoleColor.Yellow);
+            Log("MOD", "    Option B: Manually install CSharpLoader:", ConsoleColor.Yellow);
+            Log("MOD", "             1. Download from https://github.com/czastack/CSharpLoader/releases", ConsoleColor.Yellow);
+            Log("MOD", "             2. Extract dwmapi.dll to:", ConsoleColor.Yellow);
+            Log("MOD", $"                {win64Dir}", ConsoleColor.Yellow);
+            Log("MOD", "             3. Extract CSharpLoader/ folder to same directory", ConsoleColor.Yellow);
+            Log("MOD", "", ConsoleColor.Red);
+        }
+        else
+        {
+            Log("MOD", "CSharpLoader (dwmapi.dll) found — mod framework OK", ConsoleColor.Green);
+        }
 
         // Look for mods folder - check multiple locations relative to this exe
         string? modsSourceDir = null;
@@ -339,6 +371,10 @@ class Program
         if (modsSourceDir != null)
         {
             Log("MOD", $"  Mod source: {modsSourceDir}", ConsoleColor.Cyan);
+
+            // Create the CSharpLoader/Mods/WukongMp.Coop/ directory structure
+            Directory.CreateDirectory(coopModDir);
+
             int copied = 0;
             int skipped = 0;
             int errors = 0;
@@ -351,7 +387,8 @@ class Program
                 if (relativePath.EndsWith(".txt", StringComparison.OrdinalIgnoreCase))
                     continue;
 
-                string destFile = Path.Combine(gameDir, relativePath);
+                // Install into CSharpLoader/Mods/WukongMp.Coop/ (not flat into Win64)
+                string destFile = Path.Combine(coopModDir, relativePath);
                 string? destSubDir = Path.GetDirectoryName(destFile);
                 if (destSubDir != null && !Directory.Exists(destSubDir))
                     Directory.CreateDirectory(destSubDir);
@@ -415,7 +452,7 @@ class Program
         int modsMissing = 0;
         foreach (var mod in criticalMods)
         {
-            string modPath = Path.Combine(gameDir, mod);
+            string modPath = Path.Combine(coopModDir, mod);
             if (File.Exists(modPath))
             {
                 modsOk++;
@@ -436,37 +473,32 @@ class Program
             return;
         }
 
-        Log("MOD", $"All {modsOk} critical mod files verified in game directory!", ConsoleColor.Green);
+        Log("MOD", $"All {modsOk} critical mod files verified in CSharpLoader/Mods/WukongMp.Coop/!", ConsoleColor.Green);
         Console.WriteLine();
 
-        // --- Prepare co-op save directory (WukongMp.Coop subfolder) ---
-        // The in-game mod redirects save files to {MOD_FOLDER}/WukongMp.Coop/
-        // This directory MUST exist for the game to write/read co-op saves (slots 7 & 8)
-        string coopSaveDir = Path.Combine(gameDir, "WukongMp.Coop");
-        Directory.CreateDirectory(coopSaveDir);
-        Log("MOD", $"Co-op save directory ready: {coopSaveDir}", ConsoleColor.DarkCyan);
+        // --- Prepare co-op save data ---
+        // The in-game mod stores save files in GetModDirectory("WukongMp.Coop")
+        // which resolves to {MOD_FOLDER}/WukongMp.Coop/ or Win64/CSharpLoader/Mods/WukongMp.Coop/
+        // Our mods are already in coopModDir, so save files go there too.
+        Directory.CreateDirectory(coopModDir);
+        Log("MOD", $"Co-op mod+save directory ready: {coopModDir}", ConsoleColor.DarkCyan);
 
-        // Seed the initial co-op save if ArchiveSaveFile.1.sav exists in game dir but not in WukongMp.Coop/
-        string seedSaveSrc = Path.Combine(gameDir, "ArchiveSaveFile.1.sav");
-        string seedSaveDst = Path.Combine(coopSaveDir, "ArchiveSaveFile.1.sav");
-        if (File.Exists(seedSaveSrc) && !File.Exists(seedSaveDst))
+        // Pre-write world save to slot 8 (matches MP Launcher flow)
+        string seedSave = Path.Combine(coopModDir, "ArchiveSaveFile.1.sav");
+        string seedSaveDst = seedSave;
+        string slot8Dst = Path.Combine(coopModDir, "ArchiveSaveFile.8.sav");
+        if (File.Exists(seedSave) && !File.Exists(slot8Dst))
         {
-            File.Copy(seedSaveSrc, seedSaveDst);
-            Log("MOD", "  Seeded co-op save: ArchiveSaveFile.1.sav -> WukongMp.Coop/", ConsoleColor.Green);
+            File.Copy(seedSave, slot8Dst);
+            Log("MOD", "  Pre-seeded world save: ArchiveSaveFile.1.sav -> ArchiveSaveFile.8.sav", ConsoleColor.Green);
         }
         else if (File.Exists(seedSaveDst))
         {
             Log("MOD", "  Co-op seed save already present.", ConsoleColor.DarkCyan);
         }
 
-        // Copy cacert.pem into WukongMp.Coop/ — the mod reads TLS certs from {MOD_FOLDER}/WukongMp.Coop/cacert.pem
-        string cacertSrc = Path.Combine(gameDir, "cacert.pem");
-        string cacertDst = Path.Combine(coopSaveDir, "cacert.pem");
-        if (File.Exists(cacertSrc) && !File.Exists(cacertDst))
-        {
-            File.Copy(cacertSrc, cacertDst);
-            Log("MOD", "  Copied cacert.pem -> WukongMp.Coop/", ConsoleColor.Green);
-        }
+        // cacert.pem is already in coopModDir from the mod install step
+        // (No separate copy needed since mods are installed directly to CSharpLoader/Mods/WukongMp.Coop/)
         Console.WriteLine();
 
         // Save settings for next time
@@ -501,7 +533,7 @@ class Program
             $"SERVER_PORT={port}",
             $"API_BASE_URL=http://localhost",
             $"JWT_TOKEN=direct-relay",
-            $"MOD_FOLDER={gameDir}"
+            $"MOD_FOLDER={csLoaderModsDir}"
         };
 
         File.WriteAllLines(handshakePath, handshake);
@@ -524,7 +556,8 @@ class Program
             var psi = new ProcessStartInfo
             {
                 FileName = gamePath,
-                WorkingDirectory = Path.GetDirectoryName(gamePath)!,
+                // WorkingDirectory must be the game install root (matching the official launcher)
+                WorkingDirectory = gameInstallRoot,
                 UseShellExecute = true
             };
             var proc = Process.Start(psi);
@@ -741,4 +774,40 @@ class Program
         Log("STATUS", "Press any key to exit...", ConsoleColor.Gray);
         Console.ReadKey();
     }
+}
+
+/// <summary>
+/// Minimal INetEventListener for diagnostic ping/pong exchange via LiteNetLib unconnected messages.
+/// </summary>
+class DiagPingListener : INetEventListener
+{
+    public bool GotPong;
+    public string? PongData;
+
+    public void OnNetworkReceiveUnconnected(IPEndPoint remoteEndPoint, NetPacketReader reader, UnconnectedMessageType messageType)
+    {
+        if (reader.AvailableBytes > 4)
+        {
+            try
+            {
+                // The relay wraps the response in writer.Put(byte[]) which is length-prefixed
+                byte[] rawData = reader.GetBytesWithLength();
+                string text = System.Text.Encoding.UTF8.GetString(rawData);
+                int pongIdx = text.IndexOf("DIRECTRELAY_DIAG_PONG");
+                if (pongIdx >= 0)
+                {
+                    PongData = text.Substring(pongIdx);
+                    GotPong = true;
+                }
+            }
+            catch { }
+        }
+    }
+
+    public void OnConnectionRequest(ConnectionRequest request) => request.Reject();
+    public void OnPeerConnected(NetPeer peer) { }
+    public void OnPeerDisconnected(NetPeer peer, DisconnectInfo disconnectInfo) { }
+    public void OnNetworkReceive(NetPeer peer, NetPacketReader reader, byte channelNumber, DeliveryMethod deliveryMethod) { }
+    public void OnNetworkError(IPEndPoint endPoint, System.Net.Sockets.SocketError socketError) { }
+    public void OnNetworkLatencyUpdate(NetPeer peer, int latency) { }
 }

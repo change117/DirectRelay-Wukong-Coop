@@ -1,0 +1,21 @@
+{
+  "Network": {
+    "Port": 7777,
+    "UpdateTimeMs": 5,
+    "DisconnectTimeoutMs": 5000,
+    "SendBufferSizeKB": 1024,
+    "ReceiveBufferSizeKB": 1024,
+    "MTU": 1400
+  },
+  "Performance": {
+    "HighPriorityThread": true,
+    "HighPriorityProcess": true,
+    "EnableStatistics": true
+  },
+  "Diagnostics": {
+    "LogPackets": false,
+    "LogConnections": true,
+    "LogErrors": true,
+    "LogFilePath": "relay_diagnostics.log"
+  }
+}

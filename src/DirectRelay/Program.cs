@@ -96,7 +96,7 @@ class Program
             _logFile = new StreamWriter(logPath, append: false) { AutoFlush = true };
             _logFile.WriteLine($"=== DirectRelay Diagnostic Log - {DateTime.Now:yyyy-MM-dd HH:mm:ss} ===");
             _logFile.WriteLine($"Machine: {Environment.MachineName} | User: {Environment.UserName} | OS: {Environment.OSVersion}");
-            _logFile.WriteLine($"LiteNetLib version: 0.9.5.2 (wire-protocol compatible with game mods)");
+            _logFile.WriteLine($"LiteNetLib version: 1.3.1 (exact match with game mod assembly reference)");
             _logFile.WriteLine();
         }
         catch { }
@@ -188,9 +188,58 @@ class Program
         Console.WriteLine();
 
         // === AUTO-SETUP: Install mods + write handshake for the HOST ===
-        AutoSetupHost(port);
+        var (setupModDir, setupUserGuid) = AutoSetupHost(port);
 
         var server = new DirectRelayServer(port);
+
+        // Pre-seed relay blob storage with the HOST's seed save data.
+        // This matches the MP Launcher's flow: the launcher downloads world.sav from the API
+        // and makes it available before the CLIENT's game tries to load it.
+        // Without this, the CLIENT's OnLoadArchive blob download returns null and falls
+        // back to a generic slot-1 save, potentially loading a different world state.
+        if (setupModDir != null)
+        {
+            string seedSavePath = Path.Combine(setupModDir, "ArchiveSaveFile.1.sav");
+            if (File.Exists(seedSavePath))
+            {
+                byte[] saveData = File.ReadAllBytes(seedSavePath);
+                server.PreSeedBlob("world.sav", saveData);
+                server.PreSeedBlob($"player_{setupUserGuid:N}.sav", saveData);
+                Log("SETUP", $"Pre-seeded relay blobs from seed save ({saveData.Length / 1024.0:F1} KB)", ConsoleColor.Green);
+            }
+            else
+            {
+                Log("SETUP", "WARNING: Seed save not found — CLIENT won't be able to download world save", ConsoleColor.Red);
+            }
+        }
+        // === Monitor handshake file consumption ===
+        // The in-game mod reads & DELETES the handshake file. If it's still there after
+        // the game has been running for a while, it means the mod isn't loading.
+        string handshakeMonitorPath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "ReadyM.Launcher", "wukong_handshake.env");
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(TimeSpan.FromSeconds(90)); // Give the game time to load
+            if (File.Exists(handshakeMonitorPath))
+            {
+                Log("WARNING", "*** HANDSHAKE FILE WAS NOT CONSUMED AFTER 90 SECONDS ***", ConsoleColor.Red);
+                Log("WARNING", $"  File still exists: {handshakeMonitorPath}", ConsoleColor.Red);
+                Log("WARNING", "  This means the in-game ReadyMP mod did NOT load.", ConsoleColor.Red);
+                Log("WARNING", "  Possible causes:", ConsoleColor.Yellow);
+                Log("WARNING", "    1. CSharpLoader (dwmapi.dll) is NOT installed in Win64/", ConsoleColor.Yellow);
+                Log("WARNING", "       -> Install it first! See the CRITICAL message above.", ConsoleColor.Yellow);
+                Log("WARNING", "    2. CSharpLoader is installed but failed to find/load mods", ConsoleColor.Yellow);
+                Log("WARNING", "       -> Check Win64/CSharpLoader/ for log files", ConsoleColor.Yellow);
+                Log("WARNING", "    3. Mod DLLs missing from Win64/CSharpLoader/Mods/WukongMp.Coop/", ConsoleColor.Yellow);
+                Log("WARNING", "    4. The game was launched through Steam instead of directly", ConsoleColor.Yellow);
+            }
+            else
+            {
+                Log("HANDSHAKE", "Handshake file was consumed by the game mod (good!)", ConsoleColor.Green);
+            }
+        });
+
         var cts = new CancellationTokenSource();
 
         Console.CancelKeyPress += (_, e) =>
@@ -209,7 +258,7 @@ class Program
         Log("SHUTDOWN", "Server stopped.", ConsoleColor.Yellow);
     }
 
-    static void AutoSetupHost(int port)
+    static (string? ModDir, Guid UserGuid) AutoSetupHost(int port)
     {
         Log("SETUP", "=== Auto-Setup: Preparing host machine ===", ConsoleColor.Cyan);
 
@@ -220,11 +269,47 @@ class Program
             Log("SETUP", "Could not find Black Myth: Wukong installation.", ConsoleColor.DarkYellow);
             Log("SETUP", "Mod auto-install skipped. Server will run relay-only.", ConsoleColor.DarkYellow);
             Console.WriteLine();
-            return;
+            return (null, Guid.Empty);
         }
 
-        string gameDir = Path.GetDirectoryName(gamePath)!;
+        // Path layout:  {install}/b1/Binaries/Win64/b1-Win64-Shipping.exe
+        string win64Dir = Path.GetDirectoryName(gamePath)!;
+        // Navigate up to game install root (Win64 -> Binaries -> b1 -> root)
+        string gameInstallRoot = Path.GetFullPath(Path.Combine(win64Dir, "..", "..", ".."));
+        // CSharpLoader mod directory: Win64/CSharpLoader/Mods/WukongMp.Coop/
+        string csLoaderModsDir = Path.Combine(win64Dir, "CSharpLoader", "Mods");
+        string coopModDir = Path.Combine(csLoaderModsDir, "WukongMp.Coop");
+
         Log("SETUP", $"Game found: {gamePath}", ConsoleColor.Green);
+        Log("SETUP", $"  Win64 dir      : {win64Dir}", ConsoleColor.DarkCyan);
+        Log("SETUP", $"  Install root   : {gameInstallRoot}", ConsoleColor.DarkCyan);
+        Log("SETUP", $"  Mod target dir : {coopModDir}", ConsoleColor.DarkCyan);
+
+        // --- Check for CSharpLoader (the mod framework) ---
+        string dwmapiPath = Path.Combine(win64Dir, "dwmapi.dll");
+        if (!File.Exists(dwmapiPath))
+        {
+            Log("SETUP", "", ConsoleColor.Red);
+            Log("SETUP", "*** CRITICAL: CSharpLoader (dwmapi.dll) NOT FOUND ***", ConsoleColor.Red);
+            Log("SETUP", "  The CSharpLoader mod framework MUST be installed for co-op to work.", ConsoleColor.Red);
+            Log("SETUP", "  Without it, the game cannot load the WukongMp.Coop mod DLLs.", ConsoleColor.Red);
+            Log("SETUP", "", ConsoleColor.Yellow);
+            Log("SETUP", "  TO FIX — Install CSharpLoader for Black Myth: Wukong:", ConsoleColor.Yellow);
+            Log("SETUP", "    Option A: Run the ReadyMP Launcher ONCE (free download at readymp.com)", ConsoleColor.Yellow);
+            Log("SETUP", "             It auto-installs CSharpLoader, then you can close it.", ConsoleColor.Yellow);
+            Log("SETUP", "    Option B: Manually install CSharpLoader:", ConsoleColor.Yellow);
+            Log("SETUP", "             1. Download from https://github.com/czastack/CSharpLoader/releases", ConsoleColor.Yellow);
+            Log("SETUP", "             2. Extract dwmapi.dll to:", ConsoleColor.Yellow);
+            Log("SETUP", $"                {win64Dir}", ConsoleColor.Yellow);
+            Log("SETUP", "             3. Extract CSharpLoader/ folder to same directory", ConsoleColor.Yellow);
+            Log("SETUP", "", ConsoleColor.Yellow);
+            Log("SETUP", "  Mod DLLs will still be installed so CSharpLoader can find them later.", ConsoleColor.Yellow);
+            Log("SETUP", "", ConsoleColor.Red);
+        }
+        else
+        {
+            Log("SETUP", "CSharpLoader (dwmapi.dll) found — mod framework OK", ConsoleColor.Green);
+        }
 
         // --- Install mod files ---
         string? modsSourceDir = null;
@@ -248,6 +333,10 @@ class Program
         if (modsSourceDir != null)
         {
             Log("SETUP", $"Mod source: {modsSourceDir}", ConsoleColor.Cyan);
+
+            // Create the CSharpLoader/Mods/WukongMp.Coop/ directory structure
+            Directory.CreateDirectory(coopModDir);
+
             int copied = 0;
             int skipped = 0;
 
@@ -257,7 +346,8 @@ class Program
                 if (relativePath.EndsWith(".txt", StringComparison.OrdinalIgnoreCase))
                     continue;
 
-                string destFile = Path.Combine(gameDir, relativePath);
+                // Install into CSharpLoader/Mods/WukongMp.Coop/ (not flat into Win64)
+                string destFile = Path.Combine(coopModDir, relativePath);
                 string? destSubDir = Path.GetDirectoryName(destFile);
                 if (destSubDir != null && !Directory.Exists(destSubDir))
                     Directory.CreateDirectory(destSubDir);
@@ -281,7 +371,7 @@ class Program
                     {
                         File.Copy(srcFile, destFile, true);
                         copied++;
-                        Log("SETUP", $"  [COPY] {relativePath}", ConsoleColor.Green);
+                        Log("SETUP", $"  [COPY] {relativePath} -> CSharpLoader/Mods/WukongMp.Coop/", ConsoleColor.Green);
                     }
                 }
                 catch (Exception ex)
@@ -304,44 +394,36 @@ class Program
             "ReadyM.Api.dll", "ReadyM.Api.Multiplayer.dll", "WukongMp.Api.dll", "WukongMp.Coop.dll"
         };
 
-        int missing = criticalMods.Count(m => !File.Exists(Path.Combine(gameDir, m)));
+        int missing = criticalMods.Count(m => !File.Exists(Path.Combine(coopModDir, m)));
         if (missing > 0)
         {
-            Log("SETUP", $"{missing} critical mod file(s) missing from {gameDir}", ConsoleColor.Red);
+            Log("SETUP", $"{missing} critical mod file(s) missing from {coopModDir}", ConsoleColor.Red);
             Log("SETUP", "Your game will not connect to this relay without them.", ConsoleColor.Red);
         }
         else
         {
-            Log("SETUP", "All 7 critical mod files verified in game directory.", ConsoleColor.Green);
+            Log("SETUP", "All 7 critical mod files verified in CSharpLoader/Mods/WukongMp.Coop/", ConsoleColor.Green);
         }
 
-        // --- Prepare co-op save directory (WukongMp.Coop subfolder) ---
-        // The in-game mod redirects save files to {MOD_FOLDER}/WukongMp.Coop/
-        // This directory MUST exist for the game to write/read co-op saves (slots 7 & 8)
-        string coopSaveDir = Path.Combine(gameDir, "WukongMp.Coop");
-        Directory.CreateDirectory(coopSaveDir);
-        Log("SETUP", $"Co-op save directory: {coopSaveDir}", ConsoleColor.DarkCyan);
+        // --- Prepare co-op save data ---
+        // The in-game mod stores save files in GetModDirectory("WukongMp.Coop")
+        // which resolves to {MOD_FOLDER}/WukongMp.Coop/ or Win64/CSharpLoader/Mods/WukongMp.Coop/
+        // Our mods are already in coopModDir = Win64/CSharpLoader/Mods/WukongMp.Coop/
+        // so save files and data files go there too.
+        Directory.CreateDirectory(coopModDir);
+        Log("SETUP", $"Co-op mod+save directory: {coopModDir}", ConsoleColor.DarkCyan);
 
-        // Seed the initial co-op save if ArchiveSaveFile.1.sav exists in game dir but not in WukongMp.Coop/
-        string seedSaveSrc = Path.Combine(gameDir, "ArchiveSaveFile.1.sav");
-        string seedSaveDst = Path.Combine(coopSaveDir, "ArchiveSaveFile.1.sav");
-        if (File.Exists(seedSaveSrc) && !File.Exists(seedSaveDst))
+        // Pre-write world save to slot 8 (matches MP Launcher flow)
+        string seedSave = Path.Combine(coopModDir, "ArchiveSaveFile.1.sav");
+        string slot8Dst = Path.Combine(coopModDir, "ArchiveSaveFile.8.sav");
+        if (File.Exists(seedSave) && !File.Exists(slot8Dst))
         {
-            File.Copy(seedSaveSrc, seedSaveDst);
-            Log("SETUP", "  Seeded co-op save: ArchiveSaveFile.1.sav -> WukongMp.Coop/", ConsoleColor.Green);
+            File.Copy(seedSave, slot8Dst);
+            Log("SETUP", "  Pre-seeded world save: ArchiveSaveFile.1.sav -> ArchiveSaveFile.8.sav", ConsoleColor.Green);
         }
-        else if (File.Exists(seedSaveDst))
+        else if (File.Exists(seedSave))
         {
             Log("SETUP", "  Co-op seed save already present.", ConsoleColor.DarkCyan);
-        }
-
-        // Copy cacert.pem into WukongMp.Coop/ — the mod reads TLS certs from {MOD_FOLDER}/WukongMp.Coop/cacert.pem
-        string cacertSrc = Path.Combine(gameDir, "cacert.pem");
-        string cacertDst = Path.Combine(coopSaveDir, "cacert.pem");
-        if (File.Exists(cacertSrc) && !File.Exists(cacertDst))
-        {
-            File.Copy(cacertSrc, cacertDst);
-            Log("SETUP", "  Copied cacert.pem -> WukongMp.Coop/", ConsoleColor.Green);
         }
 
         // --- Write handshake file for HOST (pointing to 127.0.0.1) ---
@@ -368,7 +450,7 @@ class Program
             $"SERVER_PORT={port}",
             "API_BASE_URL=http://localhost",
             "JWT_TOKEN=direct-relay",
-            $"MOD_FOLDER={gameDir}"
+            $"MOD_FOLDER={csLoaderModsDir}"
         };
 
         File.WriteAllLines(handshakePath, handshake);
@@ -383,7 +465,8 @@ class Program
             var psi = new ProcessStartInfo
             {
                 FileName = gamePath,
-                WorkingDirectory = gameDir,
+                // WorkingDirectory must be the game install root (matching the official launcher)
+                WorkingDirectory = gameInstallRoot,
                 UseShellExecute = true
             };
             var proc = Process.Start(psi);
@@ -400,6 +483,7 @@ class Program
 
         Log("SETUP", "=== Auto-Setup complete. Starting relay server... ===", ConsoleColor.Cyan);
         Console.WriteLine();
+        return (coopModDir, userGuid);
     }
 
     static string? FindGameExe()
@@ -840,6 +924,7 @@ class DirectRelayServer : INetEventListener
     long _totalBytesReceived;
     long _totalBytesSent;
     long _totalErrors;
+    bool _warnedProtocolMismatch;
     DateTime _startTime;
     DateTime _lastStatusTime;
 
@@ -917,9 +1002,20 @@ class DirectRelayServer : INetEventListener
             UnsyncedEvents = true,
             DisconnectTimeout = _config.Network.DisconnectTimeoutMs,
             UpdateTime = _config.Network.UpdateTimeMs,
-            IPv6Enabled = IPv6Mode.Disabled,
+            IPv6Enabled = false,
             UnconnectedMessagesEnabled = true
         };
+    }
+
+    /// <summary>
+    /// Pre-populate a named blob in the relay's storage so it's available
+    /// for download before any client uploads it. This matches the MP Launcher
+    /// flow where the API server already has world.sav available.
+    /// </summary>
+    public void PreSeedBlob(string name, byte[] data)
+    {
+        _blobs[name] = data;
+        Log("BLOB", $"Pre-seeded blob '{name}' ({FormatBytes(data.Length)})", ConsoleColor.Cyan);
     }
     
     RelayConfig LoadConfigInstance()
@@ -1036,6 +1132,23 @@ class DirectRelayServer : INetEventListener
         if (peers == 0)
         {
             Log("HEARTBEAT", $"Uptime {uptime:hh\\:mm\\:ss} | No connections | Attempts: {_totalConnectionAttempts} | Errors: {_totalErrors}", ConsoleColor.DarkGray);
+            
+            // Detect the "ghost packet" issue: LiteNetLib stats show bytes received but no connections
+            if (_net.EnableStatistics && _net.Statistics != null)
+            {
+                var s = _net.Statistics;
+                if (s.PacketsReceived > 0 && _totalConnectionAttempts == 0 && !_warnedProtocolMismatch)
+                {
+                    _warnedProtocolMismatch = true;
+                    Log("WARNING", "*** PACKETS RECEIVED BUT NO CONNECTION ATTEMPTS ***", ConsoleColor.Red);
+                    Log("WARNING", $"  LiteNetLib received {s.PacketsReceived} raw packet(s) ({FormatBytes(s.BytesReceived)})", ConsoleColor.Red);
+                    Log("WARNING", $"  but OnConnectionRequest was never triggered.", ConsoleColor.Red);
+                    Log("WARNING", $"  This likely means a LiteNetLib PROTOCOL VERSION MISMATCH.", ConsoleColor.Yellow);
+                    Log("WARNING", $"  The game's mod is using a different LiteNetLib version than this relay.", ConsoleColor.Yellow);
+                    Log("WARNING", $"  This relay uses LiteNetLib 1.3.1 (ProtocolId may differ from game).", ConsoleColor.Yellow);
+                    Log("WARNING", $"  Raw packet could also be a DirectRelayConnect diagnostic ping.", ConsoleColor.DarkCyan);
+                }
+            }
         }
         else
         {
@@ -1236,7 +1349,7 @@ class DirectRelayServer : INetEventListener
         }
     }
 
-    public void OnNetworkReceive(NetPeer peer, NetPacketReader reader, DeliveryMethod dm)
+    public void OnNetworkReceive(NetPeer peer, NetPacketReader reader, byte channelNumber, DeliveryMethod dm)
     {
         // Atomic counters - no lock needed
         Interlocked.Increment(ref _totalPacketsReceived);
