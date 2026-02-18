@@ -439,6 +439,36 @@ class Program
         Log("MOD", $"All {modsOk} critical mod files verified in game directory!", ConsoleColor.Green);
         Console.WriteLine();
 
+        // --- Prepare co-op save directory (WukongMp.Coop subfolder) ---
+        // The in-game mod redirects save files to {MOD_FOLDER}/WukongMp.Coop/
+        // This directory MUST exist for the game to write/read co-op saves (slots 7 & 8)
+        string coopSaveDir = Path.Combine(gameDir, "WukongMp.Coop");
+        Directory.CreateDirectory(coopSaveDir);
+        Log("MOD", $"Co-op save directory ready: {coopSaveDir}", ConsoleColor.DarkCyan);
+
+        // Seed the initial co-op save if ArchiveSaveFile.1.sav exists in game dir but not in WukongMp.Coop/
+        string seedSaveSrc = Path.Combine(gameDir, "ArchiveSaveFile.1.sav");
+        string seedSaveDst = Path.Combine(coopSaveDir, "ArchiveSaveFile.1.sav");
+        if (File.Exists(seedSaveSrc) && !File.Exists(seedSaveDst))
+        {
+            File.Copy(seedSaveSrc, seedSaveDst);
+            Log("MOD", "  Seeded co-op save: ArchiveSaveFile.1.sav -> WukongMp.Coop/", ConsoleColor.Green);
+        }
+        else if (File.Exists(seedSaveDst))
+        {
+            Log("MOD", "  Co-op seed save already present.", ConsoleColor.DarkCyan);
+        }
+
+        // Copy cacert.pem into WukongMp.Coop/ — the mod reads TLS certs from {MOD_FOLDER}/WukongMp.Coop/cacert.pem
+        string cacertSrc = Path.Combine(gameDir, "cacert.pem");
+        string cacertDst = Path.Combine(coopSaveDir, "cacert.pem");
+        if (File.Exists(cacertSrc) && !File.Exists(cacertDst))
+        {
+            File.Copy(cacertSrc, cacertDst);
+            Log("MOD", "  Copied cacert.pem -> WukongMp.Coop/", ConsoleColor.Green);
+        }
+        Console.WriteLine();
+
         // Save settings for next time
         File.WriteAllText(settingsPath,
             $"HOST_IP={hostIp}\n" +
@@ -470,7 +500,8 @@ class Program
             $"SERVER_IP={hostIp}",
             $"SERVER_PORT={port}",
             $"API_BASE_URL=http://localhost",
-            $"JWT_TOKEN=direct-relay"
+            $"JWT_TOKEN=direct-relay",
+            $"MOD_FOLDER={gameDir}"
         };
 
         File.WriteAllLines(handshakePath, handshake);
