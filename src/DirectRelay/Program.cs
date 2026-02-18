@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.IO.Compression;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
@@ -188,7 +189,7 @@ class Program
         Console.WriteLine();
 
         // === AUTO-SETUP: Install mods + write handshake for the HOST ===
-        var (setupModDir, setupUserGuid) = AutoSetupHost(port);
+        var (setupModDir, setupUserGuid) = await AutoSetupHost(port);
 
         var server = new DirectRelayServer(port);
 
@@ -227,8 +228,8 @@ class Program
                 Log("WARNING", $"  File still exists: {handshakeMonitorPath}", ConsoleColor.Red);
                 Log("WARNING", "  This means the in-game ReadyMP mod did NOT load.", ConsoleColor.Red);
                 Log("WARNING", "  Possible causes:", ConsoleColor.Yellow);
-                Log("WARNING", "    1. CSharpLoader (dwmapi.dll) is NOT installed in Win64/", ConsoleColor.Yellow);
-                Log("WARNING", "       -> Install it first! See the CRITICAL message above.", ConsoleColor.Yellow);
+                Log("WARNING", "    1. CSharpLoader (version.dll or dwmapi.dll) is NOT installed in Win64/", ConsoleColor.Yellow);
+                Log("WARNING", "       -> DirectRelay should auto-install it. If it failed, see the log above.", ConsoleColor.Yellow);
                 Log("WARNING", "    2. CSharpLoader is installed but failed to find/load mods", ConsoleColor.Yellow);
                 Log("WARNING", "       -> Check Win64/CSharpLoader/ for log files", ConsoleColor.Yellow);
                 Log("WARNING", "    3. Mod DLLs missing from Win64/CSharpLoader/Mods/WukongMp.Coop/", ConsoleColor.Yellow);
@@ -258,7 +259,7 @@ class Program
         Log("SHUTDOWN", "Server stopped.", ConsoleColor.Yellow);
     }
 
-    static (string? ModDir, Guid UserGuid) AutoSetupHost(int port)
+    static async Task<(string? ModDir, Guid UserGuid)> AutoSetupHost(int port)
     {
         Log("SETUP", "=== Auto-Setup: Preparing host machine ===", ConsoleColor.Cyan);
 
@@ -276,6 +277,8 @@ class Program
         string win64Dir = Path.GetDirectoryName(gamePath)!;
         // Navigate up to game install root (Win64 -> Binaries -> b1 -> root)
         string gameInstallRoot = Path.GetFullPath(Path.Combine(win64Dir, "..", "..", ".."));
+        // b1 directory (CSharpLoader zip extracts relative to this)
+        string b1Dir = Path.GetFullPath(Path.Combine(win64Dir, "..", ".."));
         // CSharpLoader mod directory: Win64/CSharpLoader/Mods/WukongMp.Coop/
         string csLoaderModsDir = Path.Combine(win64Dir, "CSharpLoader", "Mods");
         string coopModDir = Path.Combine(csLoaderModsDir, "WukongMp.Coop");
@@ -286,29 +289,46 @@ class Program
         Log("SETUP", $"  Mod target dir : {coopModDir}", ConsoleColor.DarkCyan);
 
         // --- Check for CSharpLoader (the mod framework) ---
+        // CSharpLoader can use either version.dll (open-source) or dwmapi.dll (ReadyMP fork) as proxy
+        string versionDllPath = Path.Combine(win64Dir, "version.dll");
         string dwmapiPath = Path.Combine(win64Dir, "dwmapi.dll");
-        if (!File.Exists(dwmapiPath))
+        string csLoaderDir = Path.Combine(win64Dir, "CSharpLoader");
+        bool hasProxyDll = File.Exists(versionDllPath) || File.Exists(dwmapiPath);
+        bool hasLoaderDir = Directory.Exists(csLoaderDir) && File.Exists(Path.Combine(csLoaderDir, "CSharpModBase.dll"));
+
+        if (!hasProxyDll || !hasLoaderDir)
         {
-            Log("SETUP", "", ConsoleColor.Red);
-            Log("SETUP", "*** CRITICAL: CSharpLoader (dwmapi.dll) NOT FOUND ***", ConsoleColor.Red);
-            Log("SETUP", "  The CSharpLoader mod framework MUST be installed for co-op to work.", ConsoleColor.Red);
-            Log("SETUP", "  Without it, the game cannot load the WukongMp.Coop mod DLLs.", ConsoleColor.Red);
             Log("SETUP", "", ConsoleColor.Yellow);
-            Log("SETUP", "  TO FIX — Install CSharpLoader for Black Myth: Wukong:", ConsoleColor.Yellow);
-            Log("SETUP", "    Option A: Run the ReadyMP Launcher ONCE (free download at readymp.com)", ConsoleColor.Yellow);
-            Log("SETUP", "             It auto-installs CSharpLoader, then you can close it.", ConsoleColor.Yellow);
-            Log("SETUP", "    Option B: Manually install CSharpLoader:", ConsoleColor.Yellow);
-            Log("SETUP", "             1. Download from https://github.com/czastack/CSharpLoader/releases", ConsoleColor.Yellow);
-            Log("SETUP", "             2. Extract dwmapi.dll to:", ConsoleColor.Yellow);
-            Log("SETUP", $"                {win64Dir}", ConsoleColor.Yellow);
-            Log("SETUP", "             3. Extract CSharpLoader/ folder to same directory", ConsoleColor.Yellow);
-            Log("SETUP", "", ConsoleColor.Yellow);
-            Log("SETUP", "  Mod DLLs will still be installed so CSharpLoader can find them later.", ConsoleColor.Yellow);
-            Log("SETUP", "", ConsoleColor.Red);
+            Log("SETUP", "*** CSharpLoader NOT FOUND — attempting automatic download... ***", ConsoleColor.Yellow);
+            Log("SETUP", "  CSharpLoader is the mod framework that loads WukongMp.Coop into the game.", ConsoleColor.Cyan);
+
+            bool installed = await TryDownloadCSharpLoader(b1Dir, win64Dir);
+            if (installed)
+            {
+                // Re-check after install
+                hasProxyDll = File.Exists(versionDllPath) || File.Exists(dwmapiPath);
+                hasLoaderDir = Directory.Exists(csLoaderDir) && File.Exists(Path.Combine(csLoaderDir, "CSharpModBase.dll"));
+            }
+
+            if (!hasProxyDll || !hasLoaderDir)
+            {
+                Log("SETUP", "", ConsoleColor.Red);
+                Log("SETUP", "*** CSharpLoader auto-install FAILED — manual install required ***", ConsoleColor.Red);
+                Log("SETUP", "  TO FIX — Install CSharpLoader for Black Myth: Wukong:", ConsoleColor.Yellow);
+                Log("SETUP", "    Option A: Run the ReadyMP Launcher ONCE (free download at readymp.com)", ConsoleColor.Yellow);
+                Log("SETUP", "             It auto-installs CSharpLoader, then you can close it.", ConsoleColor.Yellow);
+                Log("SETUP", "    Option B: Manually download from:", ConsoleColor.Yellow);
+                Log("SETUP", "             https://github.com/czastack/B1CSharpLoader/releases", ConsoleColor.Yellow);
+                Log("SETUP", "             Extract the zip so that version.dll ends up in:", ConsoleColor.Yellow);
+                Log("SETUP", $"               {win64Dir}", ConsoleColor.Yellow);
+                Log("SETUP", "             and CSharpLoader/ folder ends up in the same directory.", ConsoleColor.Yellow);
+                Log("SETUP", "", ConsoleColor.Red);
+            }
         }
         else
         {
-            Log("SETUP", "CSharpLoader (dwmapi.dll) found — mod framework OK", ConsoleColor.Green);
+            string proxyName = File.Exists(versionDllPath) ? "version.dll" : "dwmapi.dll";
+            Log("SETUP", $"CSharpLoader found (proxy: {proxyName}) — mod framework OK", ConsoleColor.Green);
         }
 
         // --- Install mod files ---
@@ -552,6 +572,120 @@ class Program
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// Downloads and installs B1CSharpLoader from GitHub (czastack/B1CSharpLoader).
+    /// The zip contains a b1/ folder that maps to the game's b1/ directory.
+    /// Files: b1/Binaries/Win64/version.dll + b1/Binaries/Win64/CSharpLoader/...
+    /// </summary>
+    static async Task<bool> TryDownloadCSharpLoader(string b1Dir, string win64Dir)
+    {
+        const string GH_API = "https://api.github.com/repos/czastack/B1CSharpLoader/releases/latest";
+        string tempZip = Path.Combine(Path.GetTempPath(), $"B1CSharpLoader_{Guid.NewGuid():N}.zip");
+
+        try
+        {
+            using var http = new System.Net.Http.HttpClient();
+            http.Timeout = TimeSpan.FromSeconds(30);
+            http.DefaultRequestHeaders.Add("User-Agent", "DirectRelay");
+
+            // Step 1: Get latest release info from GitHub API
+            Log("CSLOADER", "Querying GitHub for latest B1CSharpLoader release...", ConsoleColor.Cyan);
+            string releaseJson = await http.GetStringAsync(GH_API);
+
+            // Parse the first .zip asset download URL
+            string? downloadUrl = null;
+            string? tagName = null;
+            using (var doc = JsonDocument.Parse(releaseJson))
+            {
+                tagName = doc.RootElement.GetProperty("tag_name").GetString();
+                var assets = doc.RootElement.GetProperty("assets");
+                foreach (var asset in assets.EnumerateArray())
+                {
+                    string? name = asset.GetProperty("name").GetString();
+                    if (name != null && name.StartsWith("B1CSharpLoader") && name.EndsWith(".zip"))
+                    {
+                        downloadUrl = asset.GetProperty("browser_download_url").GetString();
+                        break;
+                    }
+                }
+            }
+
+            if (downloadUrl == null)
+            {
+                Log("CSLOADER", "Could not find B1CSharpLoader zip in latest release.", ConsoleColor.Red);
+                return false;
+            }
+
+            Log("CSLOADER", $"Found release {tagName}: {Path.GetFileName(downloadUrl)}", ConsoleColor.Cyan);
+
+            // Step 2: Download the zip
+            Log("CSLOADER", "Downloading CSharpLoader...", ConsoleColor.Yellow);
+            byte[] zipData = await http.GetByteArrayAsync(downloadUrl);
+            await File.WriteAllBytesAsync(tempZip, zipData);
+            Log("CSLOADER", $"Downloaded {zipData.Length / 1024.0:F0} KB", ConsoleColor.Cyan);
+
+            // Step 3: Extract — the zip contains b1/Binaries/Win64/... structure
+            // We need to extract so files land in the right place relative to the game's b1/ dir
+            Log("CSLOADER", "Extracting to game directory...", ConsoleColor.Yellow);
+
+            string tempExtract = Path.Combine(Path.GetTempPath(), $"B1CSLoader_extract_{Guid.NewGuid():N}");
+            System.IO.Compression.ZipFile.ExtractToDirectory(tempZip, tempExtract, true);
+
+            // The zip has b1/ at the root. Copy b1/ contents to game's b1/ dir.
+            string extractedB1 = Path.Combine(tempExtract, "b1");
+            if (Directory.Exists(extractedB1))
+            {
+                int filesCopied = 0;
+                foreach (var srcFile in Directory.GetFiles(extractedB1, "*", SearchOption.AllDirectories))
+                {
+                    string relativePath = Path.GetRelativePath(extractedB1, srcFile);
+                    string destFile = Path.Combine(b1Dir, relativePath);
+                    string? destDir = Path.GetDirectoryName(destFile);
+                    if (destDir != null && !Directory.Exists(destDir))
+                        Directory.CreateDirectory(destDir);
+
+                    // Don't overwrite existing Mods/ — our mod files go there
+                    if (relativePath.Contains("Mods" + Path.DirectorySeparatorChar))
+                        continue;
+
+                    File.Copy(srcFile, destFile, true);
+                    filesCopied++;
+                    Log("CSLOADER", $"  [INSTALL] {relativePath}", ConsoleColor.Green);
+                }
+                Log("CSLOADER", $"CSharpLoader installed successfully! ({filesCopied} files)", ConsoleColor.Green);
+
+                // Verify key files
+                bool hasProxy = File.Exists(Path.Combine(win64Dir, "version.dll")) || File.Exists(Path.Combine(win64Dir, "dwmapi.dll"));
+                bool hasBase = File.Exists(Path.Combine(win64Dir, "CSharpLoader", "CSharpModBase.dll"));
+                if (hasProxy && hasBase)
+                {
+                    Log("CSLOADER", "CSharpLoader verification passed!", ConsoleColor.Green);
+                }
+                else
+                {
+                    Log("CSLOADER", "WARNING: Some CSharpLoader files may be missing after extraction.", ConsoleColor.Yellow);
+                }
+            }
+            else
+            {
+                Log("CSLOADER", "Unexpected zip structure — no b1/ folder found.", ConsoleColor.Red);
+                return false;
+            }
+
+            // Cleanup
+            try { File.Delete(tempZip); } catch { }
+            try { Directory.Delete(tempExtract, true); } catch { }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Log("CSLOADER", $"Auto-download failed: {ex.Message}", ConsoleColor.Red);
+            try { File.Delete(tempZip); } catch { }
+            return false;
+        }
     }
 
     internal static void Log(string tag, string msg, ConsoleColor color = ConsoleColor.Gray)
