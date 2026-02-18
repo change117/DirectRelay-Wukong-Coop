@@ -240,6 +240,70 @@ class Program
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
             "ReadyM.Launcher", "wukong_handshake.env");
         string? postLaunchWin64Dir = setupWin64Dir;  // capture for async closure
+
+        // Record pre-launch version.dll state to detect Steam replacement
+        long preLaunchVersionDllSize = 0;
+        DateTime preLaunchVersionDllTime = DateTime.MinValue;
+        if (postLaunchWin64Dir != null)
+        {
+            string preLaunchVdll = Path.Combine(postLaunchWin64Dir, "version.dll");
+            if (File.Exists(preLaunchVdll))
+            {
+                var vfi = new FileInfo(preLaunchVdll);
+                preLaunchVersionDllSize = vfi.Length;
+                preLaunchVersionDllTime = vfi.LastWriteTimeUtc;
+            }
+        }
+        long capturedPreSize = preLaunchVersionDllSize;
+        DateTime capturedPreTime = preLaunchVersionDllTime;
+
+        // Early check at 15 seconds — detect Steam version.dll replacement
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(TimeSpan.FromSeconds(15));
+            if (postLaunchWin64Dir == null) return;
+
+            string vdllPath = Path.Combine(postLaunchWin64Dir, "version.dll");
+            if (!File.Exists(vdllPath)) return;
+
+            var postFi = new FileInfo(vdllPath);
+            if (capturedPreSize > 0 && postFi.Length != capturedPreSize)
+            {
+                Log("WARNING", "*** version.dll SIZE CHANGED after game launch! ***", ConsoleColor.Red);
+                Log("WARNING", $"  Before: {capturedPreSize / 1024.0:F0} KB  →  After: {postFi.Length / 1024.0:F0} KB", ConsoleColor.Red);
+                Log("WARNING", "  Steam may have replaced the CSharpLoader proxy with the original Windows DLL!", ConsoleColor.Red);
+                Log("WARNING", "  Try: Verify game files in Steam, then re-run ReadyMP Launcher to reinstall CSharpLoader.", ConsoleColor.Yellow);
+            }
+            else if (capturedPreSize > 0 && postFi.LastWriteTimeUtc != capturedPreTime)
+            {
+                Log("WARNING", "version.dll was modified after game launch (same size, different timestamp).", ConsoleColor.Yellow);
+                Log("WARNING", "  Steam may have verified or touched the file.", ConsoleColor.Yellow);
+            }
+
+            // Also check for ANY log files that CSharpLoader might have created
+            string postCsDir = Path.Combine(postLaunchWin64Dir, "CSharpLoader");
+            string[] logNames = { "CSharpLoader.log", "output.log", "loader.log", "b1cs.log" };
+            foreach (var logName in logNames)
+            {
+                string logPath = Path.Combine(postCsDir, logName);
+                if (File.Exists(logPath))
+                {
+                    var li = new FileInfo(logPath);
+                    if (li.LastWriteTime > DateTime.Now.AddMinutes(-2))
+                    {
+                        Log("DIAGNOSE", $"CSharpLoader log found (recent): {logName} ({li.Length} bytes)", ConsoleColor.Yellow);
+                        try
+                        {
+                            foreach (var line in File.ReadAllLines(logPath).TakeLast(10))
+                                if (!string.IsNullOrWhiteSpace(line))
+                                    Log("DIAGNOSE", $"  {line.TrimEnd()}", ConsoleColor.DarkYellow);
+                        }
+                        catch { }
+                    }
+                }
+            }
+        });
+
         _ = Task.Run(async () =>
         {
             await Task.Delay(TimeSpan.FromSeconds(90)); // Give the game time to load
@@ -258,34 +322,52 @@ class Program
                 {
                 // --- Post-launch CSharpLoader diagnostic ---
                 string postCsLoaderDir = Path.Combine(postLaunchWin64Dir, "CSharpLoader");
-                
-                // Check for CSharpLoader.log — this tells us if CSharpLoader ran at all
-                string csLogPath = Path.Combine(postCsLoaderDir, "CSharpLoader.log");
-                if (File.Exists(csLogPath))
+
+                // Check version.dll state
+                string postVdll = Path.Combine(postLaunchWin64Dir, "version.dll");
+                if (File.Exists(postVdll))
                 {
-                    var logInfo = new FileInfo(csLogPath);
-                    Log("DIAGNOSE", $"CSharpLoader.log found ({logInfo.Length} bytes, modified {logInfo.LastWriteTime:HH:mm:ss}):", ConsoleColor.Yellow);
-                    try
-                    {
-                        foreach (var line in File.ReadAllLines(csLogPath).TakeLast(20))
-                        {
-                            if (!string.IsNullOrWhiteSpace(line))
-                                Log("DIAGNOSE", $"  {line.TrimEnd()}", ConsoleColor.DarkYellow);
-                        }
-                    }
-                    catch { }
+                    var vfi = new FileInfo(postVdll);
+                    Log("DIAGNOSE", $"version.dll: {vfi.Length / 1024.0:F0} KB (modified {vfi.LastWriteTime:yyyy-MM-dd HH:mm:ss})", ConsoleColor.DarkCyan);
+                    if (vfi.Length < 50_000)
+                        Log("DIAGNOSE", "  *** version.dll is the Windows original, NOT CSharpLoader! This is why mods don't load. ***", ConsoleColor.Red);
                 }
                 else
                 {
-                    Log("DIAGNOSE", "CSharpLoader.log NOT FOUND — CSharpLoader may not have run at all!", ConsoleColor.Red);
-                    Log("DIAGNOSE", "  This strongly suggests version.dll is NOT loaded by the game process.", ConsoleColor.Yellow);
+                    Log("DIAGNOSE", "version.dll MISSING from Win64/!", ConsoleColor.Red);
+                }
+                
+                // Check for CSharpLoader log files
+                string[] logNames = { "CSharpLoader.log", "output.log", "loader.log", "b1cs.log" };
+                bool foundAnyLog = false;
+                foreach (var logName in logNames)
+                {
+                    string csLogPath = Path.Combine(postCsLoaderDir, logName);
+                    if (File.Exists(csLogPath))
+                    {
+                        foundAnyLog = true;
+                        var logInfo = new FileInfo(csLogPath);
+                        Log("DIAGNOSE", $"{logName} found ({logInfo.Length} bytes, modified {logInfo.LastWriteTime:HH:mm:ss}):", ConsoleColor.Yellow);
+                        try
+                        {
+                            foreach (var line in File.ReadAllLines(csLogPath).TakeLast(20))
+                                if (!string.IsNullOrWhiteSpace(line))
+                                    Log("DIAGNOSE", $"  {line.TrimEnd()}", ConsoleColor.DarkYellow);
+                        }
+                        catch { }
+                    }
+                }
+                if (!foundAnyLog)
+                {
+                    Log("DIAGNOSE", "No CSharpLoader log files found — CSharpLoader may not have run!", ConsoleColor.Red);
                     Log("DIAGNOSE", "  Possible reasons:", ConsoleColor.Yellow);
-                    Log("DIAGNOSE", "    - version.dll is the real Windows DLL, not the CSharpLoader proxy", ConsoleColor.Yellow);
-                    Log("DIAGNOSE", "    - Game's anti-tamper prevented DLL proxy loading", ConsoleColor.Yellow);
-                    Log("DIAGNOSE", "    - Steam re-launched the game in a separate process", ConsoleColor.Yellow);
+                    Log("DIAGNOSE", "    1. version.dll is the real Windows DLL, not the CSharpLoader proxy", ConsoleColor.Yellow);
+                    Log("DIAGNOSE", "    2. CSharpLoader version is incompatible with current game version", ConsoleColor.Yellow);
+                    Log("DIAGNOSE", "    3. Antivirus blocked version.dll from loading", ConsoleColor.Yellow);
+                    Log("DIAGNOSE", "    4. Game integrity check replaced version.dll before game started", ConsoleColor.Yellow);
                 }
 
-                // Check for wukong-mp-logs directory (created by WukongMp.Api when it loads)
+                // Check for wukong-mp-logs directory (created by WukongMp.Api when mod loads)
                 string[] mpLogDirs = new[]
                 {
                     Path.Combine(postLaunchWin64Dir, "wukong-mp-logs"),
@@ -300,7 +382,13 @@ class Program
                     {
                         foundMpLogs = true;
                         var logFiles = Directory.GetFiles(logDir, "*.json");
-                        Log("DIAGNOSE", $"WukongMP log dir found: {logDir} ({logFiles.Length} files)", ConsoleColor.Yellow);
+                        Log("DIAGNOSE", $"WukongMP log dir: {logDir} ({logFiles.Length} files)", ConsoleColor.Yellow);
+                        // Show timestamps of recent files
+                        foreach (var lf in logFiles.OrderByDescending(f => new FileInfo(f).LastWriteTime).Take(3))
+                        {
+                            var lfi = new FileInfo(lf);
+                            Log("DIAGNOSE", $"  {lfi.Name} ({lfi.LastWriteTime:yyyy-MM-dd HH:mm:ss})", ConsoleColor.DarkGray);
+                        }
                     }
                 }
                 if (!foundMpLogs)
@@ -311,24 +399,34 @@ class Program
                 {
                     var gameProcs = System.Diagnostics.Process.GetProcessesByName("b1-Win64-Shipping");
                     if (gameProcs.Length > 0)
-                    {
                         Log("DIAGNOSE", $"Game process IS running (PIDs: {string.Join(", ", gameProcs.Select(p => p.Id))})", ConsoleColor.DarkCyan);
-                    }
                     else
-                    {
-                        Log("DIAGNOSE", "Game process NOT found! It may have crashed or been re-launched by Steam.", ConsoleColor.Red);
-                    }
+                        Log("DIAGNOSE", "Game process NOT found! It may have crashed.", ConsoleColor.Red);
                 }
                 catch { }
 
+                // Check ReadyMP DownloadCache for info
+                string cachePath = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                    "ReadyM.Launcher", "DownloadCache", "Loader");
+                if (Directory.Exists(cachePath))
+                {
+                    var versions = Directory.GetDirectories(cachePath);
+                    Log("DIAGNOSE", $"ReadyMP DownloadCache: {versions.Length} loader version(s) cached", ConsoleColor.DarkCyan);
+                    foreach (var v in versions)
+                        Log("DIAGNOSE", $"  {Path.GetFileName(v)}", ConsoleColor.DarkGray);
+                }
+                else
+                {
+                    Log("DIAGNOSE", "ReadyMP DownloadCache not found — ReadyMP Launcher was never installed.", ConsoleColor.Yellow);
+                }
+
                 Log("WARNING", "", ConsoleColor.Red);
                 Log("WARNING", "  === HOW TO FIX ===", ConsoleColor.Yellow);
-                Log("WARNING", "  1. Check the CSharpLoader diagnostics above", ConsoleColor.Yellow);
-                Log("WARNING", "  2. If CSharpLoader.log doesn't exist, re-install CSharpLoader:", ConsoleColor.Yellow);
-                Log("WARNING", "     Download from: https://github.com/czastack/B1CSharpLoader/releases", ConsoleColor.Yellow);
-                Log("WARNING", $"     Extract to: {Path.GetFullPath(Path.Combine(postLaunchWin64Dir, "..", ".."))} (the b1/ folder)", ConsoleColor.Yellow);
+                Log("WARNING", "  1. Run ReadyMP Launcher ONCE (free at readymp.com) — it installs the correct CSharpLoader", ConsoleColor.Yellow);
+                Log("WARNING", "  2. Close ReadyMP Launcher, then run DirectRelay again", ConsoleColor.Yellow);
                 Log("WARNING", "  3. If antivirus blocks version.dll, add an exclusion for the game folder", ConsoleColor.Yellow);
-                Log("WARNING", "  4. Try closing Steam, then launch DirectRelay again", ConsoleColor.Yellow);
+                Log("WARNING", "  4. Check Windows Defender / antivirus quarantine for version.dll", ConsoleColor.Yellow);
                 } // end of if (postLaunchWin64Dir != null)
             }
             else
@@ -394,102 +492,110 @@ class Program
         bool hasProxyDll = File.Exists(versionDllPath) || File.Exists(dwmapiPath);
         bool hasLoaderDir = Directory.Exists(csLoaderDir) && File.Exists(Path.Combine(csLoaderDir, "CSharpModBase.dll"));
 
-        // Deep CSharpLoader validation - check ALL required files, not just proxy+CSharpModBase
-        string csModBaseDeps = Path.Combine(csLoaderDir, "CSharpModBase.deps.json");
-        string csModBaseRuntimeCfg = Path.Combine(csLoaderDir, "CSharpModBase.runtimeconfig.json");
-        string csTomlPath = Path.Combine(csLoaderDir, "CSharpLoader.toml");
-
-        bool needsInstall = !hasProxyDll || !hasLoaderDir;
-        bool needsRepair = false;
-
-        if (hasProxyDll && hasLoaderDir)
+        // Identify which CSharpLoader is installed (ReadyMP fork vs open-source B1CSharpLoader)
+        long versionDllSize = 0;
+        bool isReadyMPLoader = false;
+        if (File.Exists(versionDllPath))
         {
-            // CSharpLoader looks present, but verify critical support files
-            if (!File.Exists(csModBaseDeps) || !File.Exists(csModBaseRuntimeCfg))
-            {
-                Log("SETUP", "CSharpLoader INCOMPLETE — missing .NET hosting files:", ConsoleColor.Yellow);
-                if (!File.Exists(csModBaseDeps))
-                    Log("SETUP", $"  MISSING: CSharpModBase.deps.json", ConsoleColor.Red);
-                if (!File.Exists(csModBaseRuntimeCfg))
-                    Log("SETUP", $"  MISSING: CSharpModBase.runtimeconfig.json", ConsoleColor.Red);
-                Log("SETUP", "  Without these, .NET CLR cannot start and mods won't load.", ConsoleColor.Yellow);
-                needsRepair = true;
-            }
-
-            // Validate version.dll is a CSharpLoader proxy (not the real Windows DLL)
-            // Real Windows version.dll is typically 40-80 KB; CSharpLoader proxy is larger
-            if (File.Exists(versionDllPath))
-            {
-                long proxySize = new FileInfo(versionDllPath).Length;
-                Log("SETUP", $"  version.dll size: {proxySize / 1024.0:F0} KB", ConsoleColor.DarkCyan);
-                if (proxySize < 50_000) // Less than 50 KB = probably the real Windows DLL
-                {
-                    Log("SETUP", "  WARNING: version.dll looks like the real Windows API DLL, not CSharpLoader!", ConsoleColor.Red);
-                    Log("SETUP", "  CSharpLoader proxy DLLs are typically > 100 KB.", ConsoleColor.Yellow);
-                    needsRepair = true;
-                }
-            }
+            versionDllSize = new FileInfo(versionDllPath).Length;
+            // ReadyMP's version.dll is typically ~300-400 KB. B1CSharpLoader is ~100-200 KB.
+            // Real Windows version.dll is ~40 KB.
+            isReadyMPLoader = versionDllSize > 200_000;
+            Log("SETUP", $"  version.dll: {versionDllSize / 1024.0:F0} KB ({(isReadyMPLoader ? "ReadyMP fork" : versionDllSize < 50_000 ? "Windows original — NOT a mod loader!" : "B1CSharpLoader")})", ConsoleColor.DarkCyan);
         }
 
-        if (needsInstall || needsRepair)
-        {
-            string reason = needsInstall ? "NOT FOUND" : "INCOMPLETE/CORRUPTED";
-            Log("SETUP", "", ConsoleColor.Yellow);
-            Log("SETUP", $"*** CSharpLoader {reason} — attempting automatic download... ***", ConsoleColor.Yellow);
-            Log("SETUP", "  CSharpLoader is the mod framework that loads WukongMp.Coop into the game.", ConsoleColor.Cyan);
+        // Check if CSharpLoader needs to be installed (ONLY if truly missing)
+        bool needsInstall = !hasProxyDll || !hasLoaderDir;
 
-            bool installed = await TryDownloadCSharpLoader(b1Dir, win64Dir);
-            if (installed)
+        // IMPORTANT: Do NOT treat ReadyMP's CSharpLoader as "incomplete" just because
+        // deps.json/runtimeconfig.json are missing. ReadyMP's fork hosts .NET differently
+        // and does NOT use those files. Previous versions incorrectly flagged this and
+        // replaced ReadyMP's version.dll with the incompatible open-source B1CSharpLoader.
+
+        if (needsInstall)
+        {
+            Log("SETUP", "", ConsoleColor.Yellow);
+            Log("SETUP", "*** CSharpLoader NOT FOUND ***", ConsoleColor.Yellow);
+            Log("SETUP", "  CSharpLoader is the mod framework that loads WukongMp.Coop into the game.", ConsoleColor.Cyan);
+            Log("SETUP", "", ConsoleColor.Yellow);
+
+            // FIRST: Try to restore from ReadyMP's DownloadCache
+            bool restored = TryRestoreFromReadyMPCache(b1Dir, win64Dir);
+            if (restored)
             {
-                // Re-check after install
                 hasProxyDll = File.Exists(versionDllPath) || File.Exists(dwmapiPath);
                 hasLoaderDir = Directory.Exists(csLoaderDir) && File.Exists(Path.Combine(csLoaderDir, "CSharpModBase.dll"));
+            }
+
+            // SECOND: If still missing, try B1CSharpLoader from GitHub (LAST RESORT)
+            if (!hasProxyDll || !hasLoaderDir)
+            {
+                Log("SETUP", "ReadyMP cache not available. Trying B1CSharpLoader from GitHub...", ConsoleColor.Yellow);
+                Log("SETUP", "  WARNING: Open-source B1CSharpLoader may lack ICSharpModExV2 interface", ConsoleColor.Yellow);
+                Log("SETUP", "  needed by WukongMp.Coop. If mods don't load, install ReadyMP Launcher.", ConsoleColor.Yellow);
+
+                bool installed = await TryDownloadCSharpLoader(b1Dir, win64Dir);
+                if (installed)
+                {
+                    hasProxyDll = File.Exists(versionDllPath) || File.Exists(dwmapiPath);
+                    hasLoaderDir = Directory.Exists(csLoaderDir) && File.Exists(Path.Combine(csLoaderDir, "CSharpModBase.dll"));
+                }
             }
 
             if (!hasProxyDll || !hasLoaderDir)
             {
                 Log("SETUP", "", ConsoleColor.Red);
-                Log("SETUP", "*** CSharpLoader auto-install FAILED — manual install required ***", ConsoleColor.Red);
-                Log("SETUP", "  TO FIX — Install CSharpLoader for Black Myth: Wukong:", ConsoleColor.Yellow);
-                Log("SETUP", "    Option A: Run the ReadyMP Launcher ONCE (free download at readymp.com)", ConsoleColor.Yellow);
-                Log("SETUP", "             It auto-installs CSharpLoader, then you can close it.", ConsoleColor.Yellow);
-                Log("SETUP", "    Option B: Manually download from:", ConsoleColor.Yellow);
-                Log("SETUP", "             https://github.com/czastack/B1CSharpLoader/releases", ConsoleColor.Yellow);
-                Log("SETUP", "             Extract the zip so that version.dll ends up in:", ConsoleColor.Yellow);
-                Log("SETUP", $"               {win64Dir}", ConsoleColor.Yellow);
-                Log("SETUP", "             and CSharpLoader/ folder ends up in the same directory.", ConsoleColor.Yellow);
+                Log("SETUP", "*** CSharpLoader install FAILED — manual install required ***", ConsoleColor.Red);
+                Log("SETUP", "  BEST FIX: Run the ReadyMP Launcher ONCE (free download at readymp.com)", ConsoleColor.Yellow);
+                Log("SETUP", "            It auto-installs the correct CSharpLoader, then you can close it.", ConsoleColor.Yellow);
+                Log("SETUP", "  Alt: Download from https://github.com/czastack/B1CSharpLoader/releases", ConsoleColor.Yellow);
+                Log("SETUP", $"       Extract so version.dll ends up in: {win64Dir}", ConsoleColor.Yellow);
                 Log("SETUP", "", ConsoleColor.Red);
             }
         }
-        
-        // Re-evaluate after potential install/repair
+        else if (versionDllSize < 50_000 && File.Exists(versionDllPath))
+        {
+            // version.dll exists but looks like the real Windows DLL (not a CSharpLoader proxy)
+            Log("SETUP", "", ConsoleColor.Red);
+            Log("SETUP", "*** WARNING: version.dll is too small — likely the real Windows DLL! ***", ConsoleColor.Red);
+            Log("SETUP", "  CSharpLoader proxy DLLs are typically > 100 KB.", ConsoleColor.Yellow);
+            Log("SETUP", "  Attempting to restore from ReadyMP cache...", ConsoleColor.Yellow);
+            bool restored = TryRestoreFromReadyMPCache(b1Dir, win64Dir);
+            if (!restored)
+            {
+                Log("SETUP", "  Could not restore. Run ReadyMP Launcher once to reinstall CSharpLoader.", ConsoleColor.Yellow);
+            }
+        }
+
+        // Re-evaluate after potential install/restore
         hasProxyDll = File.Exists(versionDllPath) || File.Exists(dwmapiPath);
         hasLoaderDir = Directory.Exists(csLoaderDir) && File.Exists(Path.Combine(csLoaderDir, "CSharpModBase.dll"));
 
         if (hasProxyDll && hasLoaderDir)
         {
             string proxyName = File.Exists(versionDllPath) ? "version.dll" : "dwmapi.dll";
-            Log("SETUP", $"CSharpLoader found (proxy: {proxyName}) — mod framework OK", ConsoleColor.Green);
+            long finalSize = File.Exists(versionDllPath) ? new FileInfo(versionDllPath).Length : 0;
+            Log("SETUP", $"CSharpLoader found (proxy: {proxyName}, {finalSize / 1024.0:F0} KB) — mod framework OK", ConsoleColor.Green);
         }
 
-        // --- Ensure CSharpLoader.toml config exists ---
-        // CSharpLoader reads this to know where mods are and how to initialize .NET CLR.
-        // Without it, CSharpLoader may silently fail to load any mods.
+        // --- Read b1cs.ini (CSharpLoader config) for diagnostics ---
+        // b1cs.ini is the ACTUAL config file for B1CSharpLoader and ReadyMP's fork.
+        // CSharpLoader.toml is NOT used by either version — do not create it.
         if (Directory.Exists(csLoaderDir))
         {
-            EnsureCSharpLoaderConfig(csLoaderDir, csTomlPath);
+            DiagnoseCSharpLoaderConfig(csLoaderDir);
         }
 
         // --- Diagnostic: Dump CSharpLoader directory contents ---
         if (Directory.Exists(csLoaderDir))
         {
-            Log("CSLOADER", "=== CSharpLoader Directory Contents ===", ConsoleColor.DarkCyan);
+            Log("CSLOADER", "=== CSharpLoader Directory Contents (Win64/) ===", ConsoleColor.DarkCyan);
             try
             {
                 foreach (var file in Directory.GetFiles(csLoaderDir))
                 {
                     var fi = new FileInfo(file);
-                    Log("CSLOADER", $"  {fi.Name,-45} {fi.Length / 1024.0,8:F1} KB", ConsoleColor.DarkGray);
+                    Log("CSLOADER", $"  {fi.Name,-45} {fi.Length / 1024.0,8:F1} KB  ({fi.LastWriteTime:yyyy-MM-dd HH:mm})", ConsoleColor.DarkGray);
                 }
                 string modsSubDir = Path.Combine(csLoaderDir, "Mods");
                 if (Directory.Exists(modsSubDir))
@@ -500,24 +606,48 @@ class Program
                         Log("CSLOADER", $"  Mods/{Path.GetFileName(dir)}/  ({fileCount} files)", ConsoleColor.DarkGray);
                     }
                 }
-                // Check for CSharpLoader log
-                string csLogPath = Path.Combine(csLoaderDir, "CSharpLoader.log");
-                if (File.Exists(csLogPath))
-                {
-                    var logContent = File.ReadAllText(csLogPath);
-                    Log("CSLOADER", $"  CSharpLoader.log exists ({logContent.Length} bytes):", ConsoleColor.Yellow);
-                    foreach (var line in logContent.Split('\n').TakeLast(10))
-                    {
-                        if (!string.IsNullOrWhiteSpace(line))
-                            Log("CSLOADER", $"    {line.TrimEnd()}", ConsoleColor.DarkYellow);
-                    }
-                }
             }
             catch (Exception ex)
             {
                 Log("CSLOADER", $"  Error listing dir: {ex.Message}", ConsoleColor.Red);
             }
-            Log("CSLOADER", "========================================", ConsoleColor.DarkCyan);
+            Log("CSLOADER", "================================================", ConsoleColor.DarkCyan);
+        }
+
+        // --- Check ALL AppData CSharpLoader locations ---
+        // ReadyMP may use either WukongMP/ (new) or game_modes/Black Myth Wukong Co-op/ (old)
+        string appDataBase = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "ReadyM.Launcher");
+        string[] appDataLoaderPaths = new[]
+        {
+            Path.Combine(appDataBase, "WukongMP", "CSharpLoader"),
+            Path.Combine(appDataBase, "game_modes", "Black Myth Wukong Co-op", "CSharpLoader"),
+        };
+        foreach (var adPath in appDataLoaderPaths)
+        {
+            if (Directory.Exists(adPath))
+            {
+                Log("CSLOADER", $"AppData CSharpLoader: {adPath}", ConsoleColor.DarkCyan);
+                try
+                {
+                    foreach (var file in Directory.GetFiles(adPath).Take(15))
+                    {
+                        var fi = new FileInfo(file);
+                        Log("CSLOADER", $"  {fi.Name,-45} {fi.Length / 1024.0,8:F1} KB", ConsoleColor.DarkGray);
+                    }
+                    string adMods = Path.Combine(adPath, "Mods");
+                    if (Directory.Exists(adMods))
+                    {
+                        foreach (var dir in Directory.GetDirectories(adMods))
+                        {
+                            int fc = Directory.GetFiles(dir, "*", SearchOption.AllDirectories).Length;
+                            Log("CSLOADER", $"  Mods/{Path.GetFileName(dir)}/  ({fc} files)", ConsoleColor.DarkGray);
+                        }
+                    }
+                }
+                catch (Exception ex) { Log("CSLOADER", $"  Error: {ex.Message}", ConsoleColor.Red); }
+            }
         }
 
         // --- Install mod files ---
@@ -596,53 +726,64 @@ class Program
             Log("SETUP", "No mods source folder found, checking if already installed...", ConsoleColor.DarkYellow);
         }
 
-        // --- ALSO install mods to AppData location ---
-        // ReadyMP's custom CSharpLoader looks for mods in %APPDATA%, NOT Win64/CSharpLoader/Mods/.
-        // The official ReadyMP launcher installs to: %APPDATA%/ReadyM.Launcher/WukongMP/CSharpLoader/Mods/
-        // We install to BOTH locations so it works regardless of which CSharpLoader version is installed.
-        string appDataModsDir = Path.Combine(
+        // --- ALSO install mods to AppData locations ---
+        // ReadyMP's CSharpLoader may look for mods in %APPDATA%, NOT in Win64/CSharpLoader/Mods/.
+        // The location depends on the CSharpLoader version — we install to ALL possible paths.
+        //   New path (loader > 0.7.303.1106): %APPDATA%/ReadyM.Launcher/WukongMP/CSharpLoader/Mods/
+        //   Old path (loader <= 0.7.303.1106): %APPDATA%/ReadyM.Launcher/game_modes/Black Myth Wukong Co-op/CSharpLoader/Mods/
+        string appDataNew = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
             "ReadyM.Launcher", "WukongMP", "CSharpLoader", "Mods");
+        string appDataOld = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "ReadyM.Launcher", "game_modes", "Black Myth Wukong Co-op", "CSharpLoader", "Mods");
+        // Use the "new" path as the canonical one for handshake MOD_FOLDER
+        string appDataModsDir = appDataNew;
         string appDataCoopModDir = Path.Combine(appDataModsDir, "WukongMp.Coop");
 
-        Log("SETUP", $"Also installing mods to AppData (ReadyMP CSharpLoader path)...", ConsoleColor.Cyan);
-        Log("SETUP", $"  AppData mod dir: {appDataCoopModDir}", ConsoleColor.DarkCyan);
+        string[] allAppDataModDirs = new[] { appDataNew, appDataOld };
 
-        // Copy from game-dir mod location (which we just populated) to AppData
+        Log("SETUP", $"Installing mods to AppData locations (ReadyMP CSharpLoader paths)...", ConsoleColor.Cyan);
+
+        // Copy from game-dir mod location (which we just populated) to BOTH AppData paths
         if (Directory.Exists(coopModDir))
         {
-            Directory.CreateDirectory(appDataCoopModDir);
-            int appDataCopied = 0;
-            foreach (var srcFile in Directory.GetFiles(coopModDir, "*", SearchOption.AllDirectories))
+            foreach (var appDataModPath in allAppDataModDirs)
             {
-                string relativePath = Path.GetRelativePath(coopModDir, srcFile);
-                string destFile = Path.Combine(appDataCoopModDir, relativePath);
-                string? destSubDir = Path.GetDirectoryName(destFile);
-                if (destSubDir != null && !Directory.Exists(destSubDir))
-                    Directory.CreateDirectory(destSubDir);
+                string appDataCoopPath = Path.Combine(appDataModPath, "WukongMp.Coop");
+                Directory.CreateDirectory(appDataCoopPath);
+                int appDataCopied = 0;
+                foreach (var srcFile in Directory.GetFiles(coopModDir, "*", SearchOption.AllDirectories))
+                {
+                    string relativePath = Path.GetRelativePath(coopModDir, srcFile);
+                    string destFile = Path.Combine(appDataCoopPath, relativePath);
+                    string? destSubDir = Path.GetDirectoryName(destFile);
+                    if (destSubDir != null && !Directory.Exists(destSubDir))
+                        Directory.CreateDirectory(destSubDir);
 
-                try
-                {
-                    var srcInfo = new FileInfo(srcFile);
-                    bool needsCopy = true;
-                    if (File.Exists(destFile))
+                    try
                     {
-                        var dstInfo = new FileInfo(destFile);
-                        if (srcInfo.Length == dstInfo.Length && srcInfo.LastWriteTimeUtc == dstInfo.LastWriteTimeUtc)
-                            needsCopy = false;
+                        var srcInfo = new FileInfo(srcFile);
+                        bool needsCopy = true;
+                        if (File.Exists(destFile))
+                        {
+                            var dstInfo = new FileInfo(destFile);
+                            if (srcInfo.Length == dstInfo.Length && srcInfo.LastWriteTimeUtc == dstInfo.LastWriteTimeUtc)
+                                needsCopy = false;
+                        }
+                        if (needsCopy)
+                        {
+                            File.Copy(srcFile, destFile, true);
+                            appDataCopied++;
+                        }
                     }
-                    if (needsCopy)
+                    catch (Exception ex)
                     {
-                        File.Copy(srcFile, destFile, true);
-                        appDataCopied++;
+                        Log("SETUP", $"  [FAIL] AppData copy {relativePath}: {ex.Message}", ConsoleColor.Red);
                     }
                 }
-                catch (Exception ex)
-                {
-                    Log("SETUP", $"  [FAIL] AppData copy {relativePath}: {ex.Message}", ConsoleColor.Red);
-                }
+                Log("SETUP", $"  {appDataModPath}: {appDataCopied} files synced", ConsoleColor.Green);
             }
-            Log("SETUP", $"  AppData mods: {appDataCopied} files synced", ConsoleColor.Green);
         }
 
         // Verify critical mods
@@ -664,20 +805,16 @@ class Program
         }
 
         // --- Prepare co-op save data ---
-        // The in-game mod stores save files in GetModDirectory("WukongMp.Coop")
-        // which resolves to {MOD_FOLDER}/WukongMp.Coop/
-        // We use the AppData path (matching ReadyMP's official behavior) so the mod
-        // can find save files regardless of which CSharpLoader variant is installed.
+        // Install saves to ALL locations (game dir + both AppData paths)
         Directory.CreateDirectory(coopModDir);
         Directory.CreateDirectory(appDataCoopModDir);
         Log("SETUP", $"Co-op mod+save directories:", ConsoleColor.DarkCyan);
-        Log("SETUP", $"  Game dir: {coopModDir}", ConsoleColor.DarkCyan);
-        Log("SETUP", $"  AppData:  {appDataCoopModDir}", ConsoleColor.DarkCyan);
+        Log("SETUP", $"  Game dir   : {coopModDir}", ConsoleColor.DarkCyan);
+        Log("SETUP", $"  AppData new: {appDataCoopModDir}", ConsoleColor.DarkCyan);
 
-        // Pre-write world save to slot 8 (matches MP Launcher flow) — in BOTH locations
+        // Pre-write world save to slot 8 (matches MP Launcher flow) — in ALL locations
         string seedSave = Path.Combine(coopModDir, "ArchiveSaveFile.1.sav");
         string slot8Dst = Path.Combine(coopModDir, "ArchiveSaveFile.8.sav");
-        string slot8AppData = Path.Combine(appDataCoopModDir, "ArchiveSaveFile.8.sav");
         if (File.Exists(seedSave))
         {
             if (!File.Exists(slot8Dst))
@@ -685,15 +822,17 @@ class Program
                 File.Copy(seedSave, slot8Dst);
                 Log("SETUP", "  Pre-seeded slot 8 in game dir", ConsoleColor.Green);
             }
-            if (!File.Exists(slot8AppData))
+            // Seed all AppData locations
+            foreach (var appDataModPath in allAppDataModDirs)
             {
-                File.Copy(seedSave, slot8AppData);
-                Log("SETUP", "  Pre-seeded slot 8 in AppData", ConsoleColor.Green);
+                string adCoopDir = Path.Combine(appDataModPath, "WukongMp.Coop");
+                Directory.CreateDirectory(adCoopDir);
+                string adSlot8 = Path.Combine(adCoopDir, "ArchiveSaveFile.8.sav");
+                string adSeed = Path.Combine(adCoopDir, "ArchiveSaveFile.1.sav");
+                if (!File.Exists(adSlot8)) File.Copy(seedSave, adSlot8);
+                if (!File.Exists(adSeed)) File.Copy(seedSave, adSeed);
             }
-            // Also copy seed save to AppData if not already there
-            string seedAppData = Path.Combine(appDataCoopModDir, "ArchiveSaveFile.1.sav");
-            if (!File.Exists(seedAppData))
-                File.Copy(seedSave, seedAppData);
+            Log("SETUP", "  Pre-seeded slot 8 in AppData paths", ConsoleColor.Green);
         }
         else
         {
@@ -943,14 +1082,152 @@ class Program
     }
 
     /// <summary>
-    /// Ensures CSharpLoader.toml exists with correct configuration.
-    /// Without this file, CSharpLoader may silently fail to load mods.
+    /// Tries to restore CSharpLoader from ReadyMP's DownloadCache.
+    /// ReadyMP Launcher caches CSharpLoader at: %APPDATA%/ReadyM.Launcher/DownloadCache/Loader/{version}/
+    /// Each version has @GAME/ (goes to b1/) and @APPDATA/ (goes to profile folder).
     /// </summary>
-    static void EnsureCSharpLoaderConfig(string csLoaderDir, string tomlPath)
+    static bool TryRestoreFromReadyMPCache(string b1Dir, string win64Dir)
     {
+        string cachePath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "ReadyM.Launcher", "DownloadCache", "Loader");
+
+        if (!Directory.Exists(cachePath))
+        {
+            Log("CSLOADER", "ReadyMP DownloadCache not found — ReadyMP Launcher was never installed.", ConsoleColor.Yellow);
+            return false;
+        }
+
+        // Find the latest cached version with @GAME content
+        var versionDirs = Directory.GetDirectories(cachePath)
+            .OrderByDescending(d => Path.GetFileName(d)) // Sort by version string (descending)
+            .ToList();
+
+        Log("CSLOADER", $"Found {versionDirs.Count} cached ReadyMP CSharpLoader version(s):", ConsoleColor.Cyan);
+        foreach (var vd in versionDirs)
+            Log("CSLOADER", $"  {Path.GetFileName(vd)}", ConsoleColor.DarkGray);
+
+        foreach (var versionDir in versionDirs)
+        {
+            string gameDir = Path.Combine(versionDir, "@GAME");
+            if (!Directory.Exists(gameDir)) continue;
+
+            // Check for version.dll inside @GAME
+            bool hasFiles = Directory.GetFiles(gameDir, "*", SearchOption.AllDirectories).Length > 0;
+            if (!hasFiles) continue;
+
+            string version = Path.GetFileName(versionDir);
+            Log("CSLOADER", $"Restoring CSharpLoader from ReadyMP cache (version {version})...", ConsoleColor.Yellow);
+
+            try
+            {
+                int restored = 0;
+                foreach (var srcFile in Directory.GetFiles(gameDir, "*", SearchOption.AllDirectories))
+                {
+                    string relativePath = Path.GetRelativePath(gameDir, srcFile);
+                    string destFile = Path.Combine(b1Dir, relativePath);
+                    string? destDir = Path.GetDirectoryName(destFile);
+                    if (destDir != null && !Directory.Exists(destDir))
+                        Directory.CreateDirectory(destDir);
+
+                    // Don't overwrite our mod files
+                    if (relativePath.Contains("Mods" + Path.DirectorySeparatorChar))
+                        continue;
+
+                    File.Copy(srcFile, destFile, true);
+                    restored++;
+                    Log("CSLOADER", $"  [RESTORE] {relativePath}", ConsoleColor.Green);
+                }
+
+                // Also restore @APPDATA content if present
+                string appDataDir = Path.Combine(versionDir, "@APPDATA");
+                if (Directory.Exists(appDataDir))
+                {
+                    // Determine profile folder (new vs old path)
+                    string profileFolder = Path.Combine(
+                        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                        "ReadyM.Launcher", "WukongMP");
+                    // Use old path for older versions
+                    if (string.Compare(version, "0.7.303.1106", StringComparison.OrdinalIgnoreCase) <= 0)
+                    {
+                        profileFolder = Path.Combine(
+                            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                            "ReadyM.Launcher", "game_modes", "Black Myth Wukong Co-op");
+                    }
+
+                    foreach (var srcFile in Directory.GetFiles(appDataDir, "*", SearchOption.AllDirectories))
+                    {
+                        string relativePath = Path.GetRelativePath(appDataDir, srcFile);
+                        string destFile = Path.Combine(profileFolder, relativePath);
+                        string? destSubDir = Path.GetDirectoryName(destFile);
+                        if (destSubDir != null && !Directory.Exists(destSubDir))
+                            Directory.CreateDirectory(destSubDir);
+
+                        // Don't overwrite mods
+                        if (relativePath.Contains("Mods" + Path.DirectorySeparatorChar))
+                            continue;
+
+                        File.Copy(srcFile, destFile, true);
+                        restored++;
+                        Log("CSLOADER", $"  [RESTORE @APPDATA] {relativePath}", ConsoleColor.Green);
+                    }
+                }
+
+                Log("CSLOADER", $"Restored {restored} files from ReadyMP cache!", ConsoleColor.Green);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Log("CSLOADER", $"Restore failed: {ex.Message}", ConsoleColor.Red);
+            }
+        }
+
+        Log("CSLOADER", "No usable @GAME content found in ReadyMP cache.", ConsoleColor.Yellow);
+        return false;
+    }
+
+    /// <summary>
+    /// Reads and displays CSharpLoader config files (b1cs.ini, CSharpLoader.toml) for diagnostics.
+    /// Does NOT create or modify any config files — that was causing problems in v1.4.2.
+    /// </summary>
+    static void DiagnoseCSharpLoaderConfig(string csLoaderDir)
+    {
+        // Check b1cs.ini (the ACTUAL config file for B1CSharpLoader and ReadyMP's fork)
+        string b1csIniPath = Path.Combine(csLoaderDir, "b1cs.ini");
+        if (File.Exists(b1csIniPath))
+        {
+            try
+            {
+                string content = File.ReadAllText(b1csIniPath);
+                Log("CSLOADER", $"b1cs.ini found ({content.Length} bytes):", ConsoleColor.DarkCyan);
+                if (content.Length == 0)
+                {
+                    Log("CSLOADER", "  *** b1cs.ini is EMPTY — CSharpLoader may use defaults ***", ConsoleColor.Yellow);
+                }
+                else
+                {
+                    foreach (var line in content.Split('\n'))
+                    {
+                        string trimmed = line.TrimEnd();
+                        if (!string.IsNullOrWhiteSpace(trimmed))
+                            Log("CSLOADER", $"  {trimmed}", ConsoleColor.DarkGray);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("CSLOADER", $"Could not read b1cs.ini: {ex.Message}", ConsoleColor.Yellow);
+            }
+        }
+        else
+        {
+            Log("CSLOADER", "b1cs.ini not found (CSharpLoader will use defaults)", ConsoleColor.DarkGray);
+        }
+
+        // Check CSharpLoader.toml (may exist if user or previous version created it)
+        string tomlPath = Path.Combine(csLoaderDir, "CSharpLoader.toml");
         if (File.Exists(tomlPath))
         {
-            // Read and display existing config for diagnostics
             try
             {
                 string content = File.ReadAllText(tomlPath);
@@ -961,62 +1238,23 @@ class Program
                     if (!string.IsNullOrWhiteSpace(trimmed))
                         Log("CSLOADER", $"  {trimmed}", ConsoleColor.DarkGray);
                 }
-
-                // Check if the mods path is configured — warn if it points elsewhere
-                string lower = content.ToLowerInvariant();
-                if (lower.Contains("mods") && lower.Contains("="))
-                {
-                    // Extract the mods path value for diagnostics
-                    foreach (var line in content.Split('\n'))
-                    {
-                        string t = line.Trim();
-                        if (t.StartsWith("mods", StringComparison.OrdinalIgnoreCase) && t.Contains('='))
-                        {
-                            string val = t.Substring(t.IndexOf('=') + 1).Trim().Trim('"');
-                            Log("CSLOADER", $"  → Mods path configured as: \"{val}\"", ConsoleColor.Cyan);
-                            // If it's an absolute path, check if it exists
-                            if (Path.IsPathRooted(val) && !Directory.Exists(val))
-                            {
-                                Log("CSLOADER", $"  WARNING: Configured mods path does NOT exist!", ConsoleColor.Red);
-                                Log("CSLOADER", $"  Mods won't load from this path.", ConsoleColor.Yellow);
-                            }
-                        }
-                    }
-                }
             }
-            catch (Exception ex)
-            {
-                Log("CSLOADER", $"Could not read CSharpLoader.toml: {ex.Message}", ConsoleColor.Yellow);
-            }
+            catch { }
         }
-        else
+
+        // Check for any other config files
+        string[] configNames = { "config.ini", "config.json", "settings.ini", "loader.ini" };
+        foreach (var cfg in configNames)
         {
-            // CSharpLoader.toml is MISSING — this is likely why mods don't load!
-            Log("CSLOADER", "*** CSharpLoader.toml NOT FOUND — creating default config ***", ConsoleColor.Yellow);
-            Log("CSLOADER", "  This file is required for CSharpLoader to know where mods are.", ConsoleColor.Cyan);
-
-            // Write a standard CSharpLoader.toml that scans the Mods/ subdirectory
-            string tomlContent = @"[coreclr]
-# Path to the .NET runtime. Empty = auto-detect from game directory.
-path = """"
-
-[mod_loader]
-# Whether to load mods on a separate thread
-thread = true
-# Delay in ms before loading mods (gives the game time to initialize)
-delay = 5000
-# Path to the mods directory (relative to CSharpLoader/ folder)
-mods = ""Mods""
-";
-            try
+            string cfgPath = Path.Combine(csLoaderDir, cfg);
+            if (File.Exists(cfgPath))
             {
-                File.WriteAllText(tomlPath, tomlContent);
-                Log("CSLOADER", $"Created CSharpLoader.toml at: {tomlPath}", ConsoleColor.Green);
-                Log("CSLOADER", $"  Mods path: \"Mods\" (= {Path.Combine(csLoaderDir, "Mods")})", ConsoleColor.DarkCyan);
-            }
-            catch (Exception ex)
-            {
-                Log("CSLOADER", $"FAILED to create CSharpLoader.toml: {ex.Message}", ConsoleColor.Red);
+                try
+                {
+                    string content = File.ReadAllText(cfgPath);
+                    Log("CSLOADER", $"{cfg} found ({content.Length} bytes)", ConsoleColor.DarkCyan);
+                }
+                catch { }
             }
         }
     }
