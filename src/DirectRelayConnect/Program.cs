@@ -530,6 +530,33 @@ class Program
             $"GAME_PATH={gamePath}\n");
         Log("SETTINGS", $"Settings saved to: {settingsPath}", ConsoleColor.DarkCyan);
 
+        // === START LOCAL MOCK API SERVER ===
+        // The in-game WukongMp.Coop mod makes HTTP requests to API_BASE_URL during initialization.
+        // Without a server responding, the mod silently fails and never calls RequestConnect().
+        // This mock handles the 4 endpoints the mod needs for save file management.
+        const int mockApiPort = 8769;
+        var mockApi = new MockApiServer(mockApiPort, Log);
+        var mockApiCts = new CancellationTokenSource();
+
+        // Pre-seed with save data if available
+        if (Directory.Exists(coopModDir))
+        {
+            mockApi.SetSeedSavePath(coopModDir);
+            string seedSavePath = Path.Combine(coopModDir, "ArchiveSaveFile.1.sav");
+            if (File.Exists(seedSavePath))
+            {
+                byte[] saveData = File.ReadAllBytes(seedSavePath);
+                Guid clientGuid = GenerateStableGuid(Environment.MachineName + Environment.UserName);
+                mockApi.PreSeedBlob("world.sav", saveData);
+                mockApi.PreSeedBlob($"player_{clientGuid:N}.sav", saveData);
+            }
+        }
+
+        _ = Task.Run(() => mockApi.StartAsync(mockApiCts.Token));
+        await Task.Delay(500); // Give mock server a moment to bind
+        Log("API-MOCK", $"Mock API server ready at {mockApi.BaseUrl}", ConsoleColor.Green);
+        Console.WriteLine();
+
         // === STEP 4: Write the handshake file ===
         Log("HANDSHAKE", "Writing handshake environment file...", ConsoleColor.Yellow);
 
@@ -553,7 +580,7 @@ class Program
             $"SERVER_ID=1",
             $"SERVER_IP={hostIp}",
             $"SERVER_PORT={port}",
-            $"API_BASE_URL=http://localhost",
+            $"API_BASE_URL={mockApi.BaseUrl}",
             $"JWT_TOKEN=direct-relay",
             $"MOD_FOLDER={csLoaderModsDir}"
         };
@@ -595,9 +622,11 @@ class Program
             Console.WriteLine();
             Log("STATUS", $"Game should connect to the relay server at {hostIp}:{port}", ConsoleColor.Cyan);
             Log("STATUS", "Check the DirectRelay server console for [CONNECT] messages.", ConsoleColor.Cyan);
+            Log("STATUS", $"Mock API server running at {mockApi.BaseUrl} (handling game save requests)", ConsoleColor.DarkCyan);
             Console.WriteLine();
-            Log("STATUS", "Press any key to exit...", ConsoleColor.Gray);
+            Log("STATUS", "Press any key to exit (mock API server will stop)...", ConsoleColor.Gray);
             Console.ReadKey();
+            mockApiCts.Cancel();
         }
         catch (Exception ex)
         {

@@ -188,8 +188,22 @@ class Program
         Log("GUI", "Launch signal received from control panel", ConsoleColor.Green);
         Console.WriteLine();
 
+        // === START MOCK API SERVER ===
+        // The in-game WukongMp.Coop mod makes HTTP requests to API_BASE_URL during initialization.
+        // Without a server responding, the mod silently fails and never calls RequestConnect().
+        // This mock handles the 4 endpoints the mod needs: file download metadata, upload SAS,
+        // blob download, and blob upload.
+        const int mockApiPort = 8769;
+        var mockApi = new MockApiServer(mockApiPort, Log);
+        var mockApiCts = new CancellationTokenSource();
+        _ = Task.Run(() => mockApi.StartAsync(mockApiCts.Token));
+        // Give the mock server a moment to bind the port
+        await Task.Delay(500);
+        Log("SETUP", $"Mock API server ready at {mockApi.BaseUrl}", ConsoleColor.Green);
+        Console.WriteLine();
+
         // === AUTO-SETUP: Install mods + write handshake for the HOST ===
-        var (setupModDir, setupUserGuid) = await AutoSetupHost(port);
+        var (setupModDir, setupUserGuid) = await AutoSetupHost(port, mockApi.BaseUrl);
 
         var server = new DirectRelayServer(port);
 
@@ -206,11 +220,17 @@ class Program
                 byte[] saveData = File.ReadAllBytes(seedSavePath);
                 server.PreSeedBlob("world.sav", saveData);
                 server.PreSeedBlob($"player_{setupUserGuid:N}.sav", saveData);
-                Log("SETUP", $"Pre-seeded relay blobs from seed save ({saveData.Length / 1024.0:F1} KB)", ConsoleColor.Green);
+                // Also pre-seed the mock API server so the game mod can download saves via HTTP
+                mockApi.PreSeedBlob("world.sav", saveData);
+                mockApi.PreSeedBlob($"player_{setupUserGuid:N}.sav", saveData);
+                mockApi.SetSeedSavePath(setupModDir);
+                Log("SETUP", $"Pre-seeded relay + API blobs from seed save ({saveData.Length / 1024.0:F1} KB)", ConsoleColor.Green);
             }
             else
             {
                 Log("SETUP", "WARNING: Seed save not found — CLIENT won't be able to download world save", ConsoleColor.Red);
+                // Still set seed path so mock can try to find it later
+                mockApi.SetSeedSavePath(setupModDir);
             }
         }
         // === Monitor handshake file consumption ===
@@ -256,10 +276,12 @@ class Program
         }
         catch (OperationCanceledException) { }
 
+        // Clean up mock API server
+        mockApiCts.Cancel();
         Log("SHUTDOWN", "Server stopped.", ConsoleColor.Yellow);
     }
 
-    static async Task<(string? ModDir, Guid UserGuid)> AutoSetupHost(int port)
+    static async Task<(string? ModDir, Guid UserGuid)> AutoSetupHost(int port, string apiBaseUrl)
     {
         Log("SETUP", "=== Auto-Setup: Preparing host machine ===", ConsoleColor.Cyan);
 
@@ -468,7 +490,7 @@ class Program
             "SERVER_ID=1",
             "SERVER_IP=127.0.0.1",
             $"SERVER_PORT={port}",
-            "API_BASE_URL=http://localhost",
+            $"API_BASE_URL={apiBaseUrl}",
             "JWT_TOKEN=direct-relay",
             $"MOD_FOLDER={csLoaderModsDir}"
         };
