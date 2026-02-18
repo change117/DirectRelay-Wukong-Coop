@@ -28,7 +28,7 @@ namespace DirectRelayConnect;
 /// </summary>
 class MockApiServer
 {
-    readonly HttpListener _listener;
+    HttpListener _listener; // NOT readonly — may need to recreate after failed Start()
     readonly int _port;
     readonly Action<string, string, ConsoleColor> _log;
     
@@ -46,7 +46,7 @@ class MockApiServer
         _port = port;
         _log = log;
         _listener = new HttpListener();
-        _listener.Prefixes.Add($"http://+:{port}/");
+        _listener.Prefixes.Add($"http://localhost:{port}/");
     }
 
     /// <summary>
@@ -69,35 +69,16 @@ class MockApiServer
 
     public async Task StartAsync(CancellationToken ct)
     {
-        try
+        if (!TryStartListener())
         {
-            _listener.Start();
-            _log("API-MOCK", $"Mock API server listening on port {_port}", ConsoleColor.Green);
-            _log("API-MOCK", $"Base URL: {BaseUrl}", ConsoleColor.Cyan);
-        }
-        catch (HttpListenerException ex) when (ex.ErrorCode == 5)
-        {
-            _log("API-MOCK", $"Cannot bind to port {_port} (access denied). Trying netsh reservation...", ConsoleColor.Yellow);
-            TryAddUrlReservation();
-            try
-            {
-                _listener.Start();
-                _log("API-MOCK", $"Mock API server listening on port {_port} (after reservation)", ConsoleColor.Green);
-            }
-            catch (Exception ex2)
-            {
-                _log("API-MOCK", $"FAILED to start mock API server: {ex2.Message}", ConsoleColor.Red);
-                _log("API-MOCK", $"The game mod WILL NOT be able to load save files.", ConsoleColor.Red);
-                _log("API-MOCK", $"Try running as Administrator, or manually run:", ConsoleColor.Yellow);
-                _log("API-MOCK", $"  netsh http add urlacl url=http://+:{_port}/ user=Everyone", ConsoleColor.Yellow);
-                return;
-            }
-        }
-        catch (Exception ex)
-        {
-            _log("API-MOCK", $"FAILED to start mock API server: {ex.Message}", ConsoleColor.Red);
+            _log("API-MOCK", $"FAILED to start mock API server on port {_port}", ConsoleColor.Red);
+            _log("API-MOCK", $"The game mod WILL NOT be able to load save files.", ConsoleColor.Red);
+            _log("API-MOCK", $"Try running as Administrator, or manually run:", ConsoleColor.Yellow);
+            _log("API-MOCK", $"  netsh http add urlacl url=http://+:{_port}/ user=Everyone", ConsoleColor.Yellow);
             return;
         }
+        _log("API-MOCK", $"Mock API server listening on port {_port}", ConsoleColor.Green);
+        _log("API-MOCK", $"Base URL: {BaseUrl}", ConsoleColor.Cyan);
 
         while (!ct.IsCancellationRequested)
         {
@@ -332,6 +313,63 @@ class MockApiServer
                 result[Uri.UnescapeDataString(kv[0])] = "";
         }
         return result;
+    }
+
+    /// <summary>
+    /// Attempts to start the HttpListener with multiple fallback strategies.
+    /// HttpListener.Start() disposes internal state on failure, so we must
+    /// create a fresh instance for each retry.
+    /// </summary>
+    bool TryStartListener()
+    {
+        // Strategy 1: http://localhost:{port}/ — usually works without admin
+        try
+        {
+            _listener = new HttpListener();
+            _listener.Prefixes.Add($"http://localhost:{_port}/");
+            _listener.Start();
+            _log("API-MOCK", $"Bound to http://localhost:{_port}/", ConsoleColor.DarkCyan);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _log("API-MOCK", $"localhost bind failed: {ex.Message}", ConsoleColor.DarkYellow);
+            try { _listener.Close(); } catch { }
+        }
+
+        // Strategy 2: http://127.0.0.1:{port}/ — sometimes works when localhost doesn't
+        try
+        {
+            _listener = new HttpListener();
+            _listener.Prefixes.Add($"http://127.0.0.1:{_port}/");
+            _listener.Start();
+            _log("API-MOCK", $"Bound to http://127.0.0.1:{_port}/", ConsoleColor.DarkCyan);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _log("API-MOCK", $"127.0.0.1 bind failed: {ex.Message}", ConsoleColor.DarkYellow);
+            try { _listener.Close(); } catch { }
+        }
+
+        // Strategy 3: Add URL reservation via netsh, then try http://+:{port}/
+        _log("API-MOCK", $"Trying netsh URL reservation for port {_port}...", ConsoleColor.Yellow);
+        TryAddUrlReservation();
+        try
+        {
+            _listener = new HttpListener();
+            _listener.Prefixes.Add($"http://+:{_port}/");
+            _listener.Start();
+            _log("API-MOCK", $"Bound to http://+:{_port}/ (after reservation)", ConsoleColor.DarkCyan);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _log("API-MOCK", $"http://+:{_port}/ bind failed: {ex.Message}", ConsoleColor.Red);
+            try { _listener.Close(); } catch { }
+        }
+
+        return false;
     }
 
     void TryAddUrlReservation()

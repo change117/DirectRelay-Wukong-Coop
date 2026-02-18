@@ -458,6 +458,53 @@ class Program
             Log("MOD", "  Will verify if mods are already in game directory...", ConsoleColor.DarkYellow);
         }
 
+        // --- ALSO install mods to AppData location ---
+        // ReadyMP's custom CSharpLoader looks for mods in %APPDATA%, NOT Win64/CSharpLoader/Mods/.
+        // We install to BOTH locations so it works regardless of which CSharpLoader version is installed.
+        string appDataModsDir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "ReadyM.Launcher", "WukongMP", "CSharpLoader", "Mods");
+        string appDataCoopModDir = Path.Combine(appDataModsDir, "WukongMp.Coop");
+
+        Log("MOD", $"  Also installing mods to AppData (ReadyMP CSharpLoader path)...", ConsoleColor.Cyan);
+        Log("MOD", $"    AppData mod dir: {appDataCoopModDir}", ConsoleColor.DarkCyan);
+
+        if (Directory.Exists(coopModDir))
+        {
+            Directory.CreateDirectory(appDataCoopModDir);
+            int appDataCopied = 0;
+            foreach (var srcFile in Directory.GetFiles(coopModDir, "*", SearchOption.AllDirectories))
+            {
+                string relativePath = Path.GetRelativePath(coopModDir, srcFile);
+                string destFile = Path.Combine(appDataCoopModDir, relativePath);
+                string? destSubDir = Path.GetDirectoryName(destFile);
+                if (destSubDir != null && !Directory.Exists(destSubDir))
+                    Directory.CreateDirectory(destSubDir);
+
+                try
+                {
+                    var srcInfo = new FileInfo(srcFile);
+                    bool needsCopy = true;
+                    if (File.Exists(destFile))
+                    {
+                        var dstInfo = new FileInfo(destFile);
+                        if (srcInfo.Length == dstInfo.Length && srcInfo.LastWriteTimeUtc == dstInfo.LastWriteTimeUtc)
+                            needsCopy = false;
+                    }
+                    if (needsCopy)
+                    {
+                        File.Copy(srcFile, destFile, true);
+                        appDataCopied++;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log("MOD", $"    [FAIL] AppData copy {relativePath}: {ex.Message}", ConsoleColor.Red);
+                }
+            }
+            Log("MOD", $"    AppData mods: {appDataCopied} files synced", ConsoleColor.Green);
+        }
+
         // Verify all critical mod files are present
         string[] criticalMods = new[]
         {
@@ -500,21 +547,35 @@ class Program
 
         // --- Prepare co-op save data ---
         // The in-game mod stores save files in GetModDirectory("WukongMp.Coop")
-        // which resolves to {MOD_FOLDER}/WukongMp.Coop/ or Win64/CSharpLoader/Mods/WukongMp.Coop/
-        // Our mods are already in coopModDir, so save files go there too.
+        // which resolves to {MOD_FOLDER}/WukongMp.Coop/
+        // Install saves to BOTH locations (game dir + AppData).
         Directory.CreateDirectory(coopModDir);
-        Log("MOD", $"Co-op mod+save directory ready: {coopModDir}", ConsoleColor.DarkCyan);
+        Directory.CreateDirectory(appDataCoopModDir);
+        Log("MOD", $"Co-op mod+save directories:", ConsoleColor.DarkCyan);
+        Log("MOD", $"  Game dir: {coopModDir}", ConsoleColor.DarkCyan);
+        Log("MOD", $"  AppData:  {appDataCoopModDir}", ConsoleColor.DarkCyan);
 
-        // Pre-write world save to slot 8 (matches MP Launcher flow)
+        // Pre-write world save to slot 8 (matches MP Launcher flow) — in BOTH locations
         string seedSave = Path.Combine(coopModDir, "ArchiveSaveFile.1.sav");
-        string seedSaveDst = seedSave;
         string slot8Dst = Path.Combine(coopModDir, "ArchiveSaveFile.8.sav");
-        if (File.Exists(seedSave) && !File.Exists(slot8Dst))
+        string slot8AppData = Path.Combine(appDataCoopModDir, "ArchiveSaveFile.8.sav");
+        if (File.Exists(seedSave))
         {
-            File.Copy(seedSave, slot8Dst);
-            Log("MOD", "  Pre-seeded world save: ArchiveSaveFile.1.sav -> ArchiveSaveFile.8.sav", ConsoleColor.Green);
+            if (!File.Exists(slot8Dst))
+            {
+                File.Copy(seedSave, slot8Dst);
+                Log("MOD", "  Pre-seeded slot 8 in game dir", ConsoleColor.Green);
+            }
+            if (!File.Exists(slot8AppData))
+            {
+                File.Copy(seedSave, slot8AppData);
+                Log("MOD", "  Pre-seeded slot 8 in AppData", ConsoleColor.Green);
+            }
+            string seedAppData = Path.Combine(appDataCoopModDir, "ArchiveSaveFile.1.sav");
+            if (!File.Exists(seedAppData))
+                File.Copy(seedSave, seedAppData);
         }
-        else if (File.Exists(seedSaveDst))
+        else
         {
             Log("MOD", "  Co-op seed save already present.", ConsoleColor.DarkCyan);
         }
@@ -582,7 +643,7 @@ class Program
             $"SERVER_PORT={port}",
             $"API_BASE_URL={mockApi.BaseUrl}",
             $"JWT_TOKEN=direct-relay",
-            $"MOD_FOLDER={csLoaderModsDir}"
+            $"MOD_FOLDER={appDataModsDir}"
         };
 
         File.WriteAllLines(handshakePath, handshake);
