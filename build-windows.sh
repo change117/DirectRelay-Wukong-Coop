@@ -85,7 +85,7 @@ echo ""
 # Create release ZIP
 echo -e "${BLUE}[6/6]${NC} Creating Windows release package..."
 cd "$PUBLISH_DIR"
-zip -r -q DirectRelay-Windows-v1.4.1.zip HOST/ CLIENT/
+zip -r -q DirectRelay-Windows-v1.4.2.zip HOST/ CLIENT/
 
 if [ $? -eq 0 ]; then
     echo -e "${GREEN}✓${NC} Release package created successfully!"
@@ -101,7 +101,7 @@ echo -e "${GREEN}BUILD COMPLETE!${NC}"
 echo "=========================================="
 echo ""
 echo "📦 Release package location:"
-echo "   $PUBLISH_DIR/DirectRelay-Windows-v1.4.1.zip"
+echo "   $PUBLISH_DIR/DirectRelay-Windows-v1.4.2.zip"
 echo ""
 echo "📁 Build outputs:"
 echo "   HOST:   $PUBLISH_DIR/HOST/DirectRelay.exe"
@@ -110,7 +110,7 @@ echo ""
 echo "🎉 Ready to release on GitHub!"
 echo ""
 echo "Next steps:"
-echo "  1. Download DirectRelay-Windows-v1.4.1.zip from Codespaces"
+echo "  1. Download DirectRelay-Windows-v1.4.2.zip from Codespaces"
 echo "  2. Test on Windows to verify it works"
 echo "  3. Upload to GitHub releases"
 echo ""

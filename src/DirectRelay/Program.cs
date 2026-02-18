@@ -203,7 +203,7 @@ class Program
         Console.WriteLine();
 
         // === AUTO-SETUP: Install mods + write handshake for the HOST ===
-        var (setupModDir, setupUserGuid) = await AutoSetupHost(port, mockApi.BaseUrl);
+        var (setupModDir, setupUserGuid, setupWin64Dir) = await AutoSetupHost(port, mockApi.BaseUrl);
 
         var server = new DirectRelayServer(port);
 
@@ -233,12 +233,13 @@ class Program
                 mockApi.SetSeedSavePath(setupModDir);
             }
         }
-        // === Monitor handshake file consumption ===
+        // === Monitor handshake file consumption + CSharpLoader diagnostics ===
         // The in-game mod reads & DELETES the handshake file. If it's still there after
         // the game has been running for a while, it means the mod isn't loading.
         string handshakeMonitorPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
             "ReadyM.Launcher", "wukong_handshake.env");
+        string? postLaunchWin64Dir = setupWin64Dir;  // capture for async closure
         _ = Task.Run(async () =>
         {
             await Task.Delay(TimeSpan.FromSeconds(90)); // Give the game time to load
@@ -247,13 +248,88 @@ class Program
                 Log("WARNING", "*** HANDSHAKE FILE WAS NOT CONSUMED AFTER 90 SECONDS ***", ConsoleColor.Red);
                 Log("WARNING", $"  File still exists: {handshakeMonitorPath}", ConsoleColor.Red);
                 Log("WARNING", "  This means the in-game ReadyMP mod did NOT load.", ConsoleColor.Red);
-                Log("WARNING", "  Possible causes:", ConsoleColor.Yellow);
-                Log("WARNING", "    1. CSharpLoader (version.dll or dwmapi.dll) is NOT installed in Win64/", ConsoleColor.Yellow);
-                Log("WARNING", "       -> DirectRelay should auto-install it. If it failed, see the log above.", ConsoleColor.Yellow);
-                Log("WARNING", "    2. CSharpLoader is installed but failed to find/load mods", ConsoleColor.Yellow);
-                Log("WARNING", "       -> Check Win64/CSharpLoader/ for log files", ConsoleColor.Yellow);
-                Log("WARNING", "    3. Mod DLLs missing from Win64/CSharpLoader/Mods/WukongMp.Coop/", ConsoleColor.Yellow);
-                Log("WARNING", "    4. The game was launched through Steam instead of directly", ConsoleColor.Yellow);
+                Log("WARNING", "", ConsoleColor.Red);
+
+                if (postLaunchWin64Dir == null)
+                {
+                    Log("WARNING", "  Game install path unknown — cannot run detailed diagnostics.", ConsoleColor.Yellow);
+                }
+                else
+                {
+                // --- Post-launch CSharpLoader diagnostic ---
+                string postCsLoaderDir = Path.Combine(postLaunchWin64Dir, "CSharpLoader");
+                
+                // Check for CSharpLoader.log — this tells us if CSharpLoader ran at all
+                string csLogPath = Path.Combine(postCsLoaderDir, "CSharpLoader.log");
+                if (File.Exists(csLogPath))
+                {
+                    var logInfo = new FileInfo(csLogPath);
+                    Log("DIAGNOSE", $"CSharpLoader.log found ({logInfo.Length} bytes, modified {logInfo.LastWriteTime:HH:mm:ss}):", ConsoleColor.Yellow);
+                    try
+                    {
+                        foreach (var line in File.ReadAllLines(csLogPath).TakeLast(20))
+                        {
+                            if (!string.IsNullOrWhiteSpace(line))
+                                Log("DIAGNOSE", $"  {line.TrimEnd()}", ConsoleColor.DarkYellow);
+                        }
+                    }
+                    catch { }
+                }
+                else
+                {
+                    Log("DIAGNOSE", "CSharpLoader.log NOT FOUND — CSharpLoader may not have run at all!", ConsoleColor.Red);
+                    Log("DIAGNOSE", "  This strongly suggests version.dll is NOT loaded by the game process.", ConsoleColor.Yellow);
+                    Log("DIAGNOSE", "  Possible reasons:", ConsoleColor.Yellow);
+                    Log("DIAGNOSE", "    - version.dll is the real Windows DLL, not the CSharpLoader proxy", ConsoleColor.Yellow);
+                    Log("DIAGNOSE", "    - Game's anti-tamper prevented DLL proxy loading", ConsoleColor.Yellow);
+                    Log("DIAGNOSE", "    - Steam re-launched the game in a separate process", ConsoleColor.Yellow);
+                }
+
+                // Check for wukong-mp-logs directory (created by WukongMp.Api when it loads)
+                string[] mpLogDirs = new[]
+                {
+                    Path.Combine(postLaunchWin64Dir, "wukong-mp-logs"),
+                    Path.Combine(Path.GetFullPath(Path.Combine(postLaunchWin64Dir, "..", "..", "..")), "wukong-mp-logs"),
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                        "ReadyM.Launcher", "WukongMP", "wukong-mp-logs")
+                };
+                bool foundMpLogs = false;
+                foreach (var logDir in mpLogDirs)
+                {
+                    if (Directory.Exists(logDir))
+                    {
+                        foundMpLogs = true;
+                        var logFiles = Directory.GetFiles(logDir, "*.json");
+                        Log("DIAGNOSE", $"WukongMP log dir found: {logDir} ({logFiles.Length} files)", ConsoleColor.Yellow);
+                    }
+                }
+                if (!foundMpLogs)
+                    Log("DIAGNOSE", "No WukongMP log directory found — mod never initialized.", ConsoleColor.Red);
+
+                // Check if game process is still alive
+                try
+                {
+                    var gameProcs = System.Diagnostics.Process.GetProcessesByName("b1-Win64-Shipping");
+                    if (gameProcs.Length > 0)
+                    {
+                        Log("DIAGNOSE", $"Game process IS running (PIDs: {string.Join(", ", gameProcs.Select(p => p.Id))})", ConsoleColor.DarkCyan);
+                    }
+                    else
+                    {
+                        Log("DIAGNOSE", "Game process NOT found! It may have crashed or been re-launched by Steam.", ConsoleColor.Red);
+                    }
+                }
+                catch { }
+
+                Log("WARNING", "", ConsoleColor.Red);
+                Log("WARNING", "  === HOW TO FIX ===", ConsoleColor.Yellow);
+                Log("WARNING", "  1. Check the CSharpLoader diagnostics above", ConsoleColor.Yellow);
+                Log("WARNING", "  2. If CSharpLoader.log doesn't exist, re-install CSharpLoader:", ConsoleColor.Yellow);
+                Log("WARNING", "     Download from: https://github.com/czastack/B1CSharpLoader/releases", ConsoleColor.Yellow);
+                Log("WARNING", $"     Extract to: {Path.GetFullPath(Path.Combine(postLaunchWin64Dir, "..", ".."))} (the b1/ folder)", ConsoleColor.Yellow);
+                Log("WARNING", "  3. If antivirus blocks version.dll, add an exclusion for the game folder", ConsoleColor.Yellow);
+                Log("WARNING", "  4. Try closing Steam, then launch DirectRelay again", ConsoleColor.Yellow);
+                } // end of if (postLaunchWin64Dir != null)
             }
             else
             {
@@ -281,7 +357,7 @@ class Program
         Log("SHUTDOWN", "Server stopped.", ConsoleColor.Yellow);
     }
 
-    static async Task<(string? ModDir, Guid UserGuid)> AutoSetupHost(int port, string apiBaseUrl)
+    static async Task<(string? ModDir, Guid UserGuid, string? Win64Dir)> AutoSetupHost(int port, string apiBaseUrl)
     {
         Log("SETUP", "=== Auto-Setup: Preparing host machine ===", ConsoleColor.Cyan);
 
@@ -292,7 +368,7 @@ class Program
             Log("SETUP", "Could not find Black Myth: Wukong installation.", ConsoleColor.DarkYellow);
             Log("SETUP", "Mod auto-install skipped. Server will run relay-only.", ConsoleColor.DarkYellow);
             Console.WriteLine();
-            return (null, Guid.Empty);
+            return (null, Guid.Empty, null);
         }
 
         // Path layout:  {install}/b1/Binaries/Win64/b1-Win64-Shipping.exe
@@ -318,10 +394,48 @@ class Program
         bool hasProxyDll = File.Exists(versionDllPath) || File.Exists(dwmapiPath);
         bool hasLoaderDir = Directory.Exists(csLoaderDir) && File.Exists(Path.Combine(csLoaderDir, "CSharpModBase.dll"));
 
-        if (!hasProxyDll || !hasLoaderDir)
+        // Deep CSharpLoader validation - check ALL required files, not just proxy+CSharpModBase
+        string csModBaseDeps = Path.Combine(csLoaderDir, "CSharpModBase.deps.json");
+        string csModBaseRuntimeCfg = Path.Combine(csLoaderDir, "CSharpModBase.runtimeconfig.json");
+        string csTomlPath = Path.Combine(csLoaderDir, "CSharpLoader.toml");
+
+        bool needsInstall = !hasProxyDll || !hasLoaderDir;
+        bool needsRepair = false;
+
+        if (hasProxyDll && hasLoaderDir)
         {
+            // CSharpLoader looks present, but verify critical support files
+            if (!File.Exists(csModBaseDeps) || !File.Exists(csModBaseRuntimeCfg))
+            {
+                Log("SETUP", "CSharpLoader INCOMPLETE — missing .NET hosting files:", ConsoleColor.Yellow);
+                if (!File.Exists(csModBaseDeps))
+                    Log("SETUP", $"  MISSING: CSharpModBase.deps.json", ConsoleColor.Red);
+                if (!File.Exists(csModBaseRuntimeCfg))
+                    Log("SETUP", $"  MISSING: CSharpModBase.runtimeconfig.json", ConsoleColor.Red);
+                Log("SETUP", "  Without these, .NET CLR cannot start and mods won't load.", ConsoleColor.Yellow);
+                needsRepair = true;
+            }
+
+            // Validate version.dll is a CSharpLoader proxy (not the real Windows DLL)
+            // Real Windows version.dll is typically 40-80 KB; CSharpLoader proxy is larger
+            if (File.Exists(versionDllPath))
+            {
+                long proxySize = new FileInfo(versionDllPath).Length;
+                Log("SETUP", $"  version.dll size: {proxySize / 1024.0:F0} KB", ConsoleColor.DarkCyan);
+                if (proxySize < 50_000) // Less than 50 KB = probably the real Windows DLL
+                {
+                    Log("SETUP", "  WARNING: version.dll looks like the real Windows API DLL, not CSharpLoader!", ConsoleColor.Red);
+                    Log("SETUP", "  CSharpLoader proxy DLLs are typically > 100 KB.", ConsoleColor.Yellow);
+                    needsRepair = true;
+                }
+            }
+        }
+
+        if (needsInstall || needsRepair)
+        {
+            string reason = needsInstall ? "NOT FOUND" : "INCOMPLETE/CORRUPTED";
             Log("SETUP", "", ConsoleColor.Yellow);
-            Log("SETUP", "*** CSharpLoader NOT FOUND — attempting automatic download... ***", ConsoleColor.Yellow);
+            Log("SETUP", $"*** CSharpLoader {reason} — attempting automatic download... ***", ConsoleColor.Yellow);
             Log("SETUP", "  CSharpLoader is the mod framework that loads WukongMp.Coop into the game.", ConsoleColor.Cyan);
 
             bool installed = await TryDownloadCSharpLoader(b1Dir, win64Dir);
@@ -347,10 +461,63 @@ class Program
                 Log("SETUP", "", ConsoleColor.Red);
             }
         }
-        else
+        
+        // Re-evaluate after potential install/repair
+        hasProxyDll = File.Exists(versionDllPath) || File.Exists(dwmapiPath);
+        hasLoaderDir = Directory.Exists(csLoaderDir) && File.Exists(Path.Combine(csLoaderDir, "CSharpModBase.dll"));
+
+        if (hasProxyDll && hasLoaderDir)
         {
             string proxyName = File.Exists(versionDllPath) ? "version.dll" : "dwmapi.dll";
             Log("SETUP", $"CSharpLoader found (proxy: {proxyName}) — mod framework OK", ConsoleColor.Green);
+        }
+
+        // --- Ensure CSharpLoader.toml config exists ---
+        // CSharpLoader reads this to know where mods are and how to initialize .NET CLR.
+        // Without it, CSharpLoader may silently fail to load any mods.
+        if (Directory.Exists(csLoaderDir))
+        {
+            EnsureCSharpLoaderConfig(csLoaderDir, csTomlPath);
+        }
+
+        // --- Diagnostic: Dump CSharpLoader directory contents ---
+        if (Directory.Exists(csLoaderDir))
+        {
+            Log("CSLOADER", "=== CSharpLoader Directory Contents ===", ConsoleColor.DarkCyan);
+            try
+            {
+                foreach (var file in Directory.GetFiles(csLoaderDir))
+                {
+                    var fi = new FileInfo(file);
+                    Log("CSLOADER", $"  {fi.Name,-45} {fi.Length / 1024.0,8:F1} KB", ConsoleColor.DarkGray);
+                }
+                string modsSubDir = Path.Combine(csLoaderDir, "Mods");
+                if (Directory.Exists(modsSubDir))
+                {
+                    foreach (var dir in Directory.GetDirectories(modsSubDir))
+                    {
+                        int fileCount = Directory.GetFiles(dir, "*", SearchOption.AllDirectories).Length;
+                        Log("CSLOADER", $"  Mods/{Path.GetFileName(dir)}/  ({fileCount} files)", ConsoleColor.DarkGray);
+                    }
+                }
+                // Check for CSharpLoader log
+                string csLogPath = Path.Combine(csLoaderDir, "CSharpLoader.log");
+                if (File.Exists(csLogPath))
+                {
+                    var logContent = File.ReadAllText(csLogPath);
+                    Log("CSLOADER", $"  CSharpLoader.log exists ({logContent.Length} bytes):", ConsoleColor.Yellow);
+                    foreach (var line in logContent.Split('\n').TakeLast(10))
+                    {
+                        if (!string.IsNullOrWhiteSpace(line))
+                            Log("CSLOADER", $"    {line.TrimEnd()}", ConsoleColor.DarkYellow);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("CSLOADER", $"  Error listing dir: {ex.Message}", ConsoleColor.Red);
+            }
+            Log("CSLOADER", "========================================", ConsoleColor.DarkCyan);
         }
 
         // --- Install mod files ---
@@ -590,7 +757,7 @@ class Program
 
         Log("SETUP", "=== Auto-Setup complete. Starting relay server... ===", ConsoleColor.Cyan);
         Console.WriteLine();
-        return (coopModDir, userGuid);
+        return (coopModDir, userGuid, win64Dir);
     }
 
     static string? FindGameExe()
@@ -772,6 +939,85 @@ class Program
             Log("CSLOADER", $"Auto-download failed: {ex.Message}", ConsoleColor.Red);
             try { File.Delete(tempZip); } catch { }
             return false;
+        }
+    }
+
+    /// <summary>
+    /// Ensures CSharpLoader.toml exists with correct configuration.
+    /// Without this file, CSharpLoader may silently fail to load mods.
+    /// </summary>
+    static void EnsureCSharpLoaderConfig(string csLoaderDir, string tomlPath)
+    {
+        if (File.Exists(tomlPath))
+        {
+            // Read and display existing config for diagnostics
+            try
+            {
+                string content = File.ReadAllText(tomlPath);
+                Log("CSLOADER", $"CSharpLoader.toml found ({content.Length} bytes):", ConsoleColor.DarkCyan);
+                foreach (var line in content.Split('\n'))
+                {
+                    string trimmed = line.TrimEnd();
+                    if (!string.IsNullOrWhiteSpace(trimmed))
+                        Log("CSLOADER", $"  {trimmed}", ConsoleColor.DarkGray);
+                }
+
+                // Check if the mods path is configured — warn if it points elsewhere
+                string lower = content.ToLowerInvariant();
+                if (lower.Contains("mods") && lower.Contains("="))
+                {
+                    // Extract the mods path value for diagnostics
+                    foreach (var line in content.Split('\n'))
+                    {
+                        string t = line.Trim();
+                        if (t.StartsWith("mods", StringComparison.OrdinalIgnoreCase) && t.Contains('='))
+                        {
+                            string val = t.Substring(t.IndexOf('=') + 1).Trim().Trim('"');
+                            Log("CSLOADER", $"  → Mods path configured as: \"{val}\"", ConsoleColor.Cyan);
+                            // If it's an absolute path, check if it exists
+                            if (Path.IsPathRooted(val) && !Directory.Exists(val))
+                            {
+                                Log("CSLOADER", $"  WARNING: Configured mods path does NOT exist!", ConsoleColor.Red);
+                                Log("CSLOADER", $"  Mods won't load from this path.", ConsoleColor.Yellow);
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("CSLOADER", $"Could not read CSharpLoader.toml: {ex.Message}", ConsoleColor.Yellow);
+            }
+        }
+        else
+        {
+            // CSharpLoader.toml is MISSING — this is likely why mods don't load!
+            Log("CSLOADER", "*** CSharpLoader.toml NOT FOUND — creating default config ***", ConsoleColor.Yellow);
+            Log("CSLOADER", "  This file is required for CSharpLoader to know where mods are.", ConsoleColor.Cyan);
+
+            // Write a standard CSharpLoader.toml that scans the Mods/ subdirectory
+            string tomlContent = @"[coreclr]
+# Path to the .NET runtime. Empty = auto-detect from game directory.
+path = """"
+
+[mod_loader]
+# Whether to load mods on a separate thread
+thread = true
+# Delay in ms before loading mods (gives the game time to initialize)
+delay = 5000
+# Path to the mods directory (relative to CSharpLoader/ folder)
+mods = ""Mods""
+";
+            try
+            {
+                File.WriteAllText(tomlPath, tomlContent);
+                Log("CSLOADER", $"Created CSharpLoader.toml at: {tomlPath}", ConsoleColor.Green);
+                Log("CSLOADER", $"  Mods path: \"Mods\" (= {Path.Combine(csLoaderDir, "Mods")})", ConsoleColor.DarkCyan);
+            }
+            catch (Exception ex)
+            {
+                Log("CSLOADER", $"FAILED to create CSharpLoader.toml: {ex.Message}", ConsoleColor.Red);
+            }
         }
     }
 
